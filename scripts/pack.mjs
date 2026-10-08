@@ -9,7 +9,7 @@ await mkdir(output, { recursive: true });
 const manifest = JSON.parse(await readFile('package.json', 'utf8'));
 const directory = await mkdtemp(join(tmpdir(), 'dsh-snapshot-package-'));
 try {
-  for (const path of ['dist', 'README.md', 'VALIDATION.md', 'LICENSE', 'cordis.patch.yml']) await cp(join(root, path), join(directory, path), { recursive: true });
+  for (const path of ['dist', 'docs', 'README.md', 'VALIDATION.md', 'LICENSE', 'cordis.patch.yml']) await cp(join(root, path), join(directory, path), { recursive: true });
   const nativePath = platform === 'macos' ? 'native/macos/build/ContextSnapshot.app' : `native/windows/publish/win-${platform.split('-')[1]}`;
   if (platform !== 'macos') {
     for (const name of ['DOTNET-LICENSE.txt', 'DOTNET-THIRD-PARTY-NOTICES.txt', 'WINDOWSDESKTOP-LICENSE.txt', 'WPF-THIRD-PARTY-NOTICES.txt', 'manifest.json']) {

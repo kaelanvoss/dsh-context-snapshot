@@ -4,27 +4,29 @@
 
 支持图片缩放、拖动、下载和文本预览，界面跟随 Harness 的浅色 / 深色主题。
 
-![快照草稿卡片示例（合成窗口内容）](docs/draft-preview.jpg)
+![快照草稿示例（Harness 官方输入区样式）](docs/draft-preview.png)
+
+示例渲染采用 Harness 官方输入区样式和插件实际组件，窗口内容为公开发布页的真实截图。
 
 ## 安装
 
-插件版本：`0.4.1`。支持 Harness `0.2.0-rc.2` 和 `0.2.1-alpha.1`；其它版本尚未核验。
+插件版本：`0.4.2`。支持 Harness `0.2.0-rc.2` 和 `0.2.1-alpha.1`；其它版本尚未核验。
 
 | 系统 | 捕获快捷键 | 安装包 |
 | --- | --- | --- |
-| macOS 13+，Apple Silicon / Intel | 左 Command + 右 Command | [macOS](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.1/dsh-context-snapshot-0.4.1-macos.tgz) |
-| Windows 10/11 x64 | 左 Ctrl + 右 Ctrl | [Windows x64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.1/dsh-context-snapshot-0.4.1-windows-x64.tgz) |
-| Windows 10/11 ARM64 | 左 Ctrl + 右 Ctrl | [Windows ARM64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.1/dsh-context-snapshot-0.4.1-windows-arm64.tgz) |
+| macOS 13+，Apple Silicon / Intel | 左 Command + 右 Command | [macOS](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.2/dsh-context-snapshot-0.4.2-macos.tgz) |
+| Windows 10/11 x64 | 左 Ctrl + 右 Ctrl | [Windows x64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.2/dsh-context-snapshot-0.4.2-windows-x64.tgz) |
+| Windows 10/11 ARM64 | 左 Ctrl + 右 Ctrl | [Windows ARM64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.2/dsh-context-snapshot-0.4.2-windows-arm64.tgz) |
 
 1. 下载对应系统的 **`.tgz` 安装包，无需解压**。
-2. 打开 Harness Desktop 的「插件 → 添加插件」，填写安装包的绝对路径，例如 `C:\Downloads\dsh-context-snapshot-0.4.1-windows-x64.tgz`。
+2. 打开 Harness Desktop 的「插件 → 添加插件」，填写安装包的绝对路径，例如 `C:\Downloads\dsh-context-snapshot-0.4.2-windows-x64.tgz`。
 3. 安装并启用插件，完全退出再打开 Harness，核对插件版本。
 
 **升级已有版本**：先完全退出 Harness（包括托盘中的进程），再通过下方 CLI 安装新版 `.tgz`，完成后重新打开应用。Windows 上运行中的采集程序会锁住安装文件，在应用内直接替换可能报 `EPERM`；通常无需先卸载或使用管理员权限。
 
 平台安装包已包含原生程序，使用时无需安装 Swift、.NET SDK 或单独的 CLI。GitHub 的 Source code ZIP / tar.gz 是源码，需要自行构建。插件尚未发布到 npm，请使用安装包路径安装。
 
-[发布说明与所有下载](https://github.com/kaelanvoss/dsh-context-snapshot/releases/tag/v0.4.1) · [安装包 SHA256 校验值](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.1/SHA256SUMS.txt)
+[发布说明与所有下载](https://github.com/kaelanvoss/dsh-context-snapshot/releases/tag/v0.4.2) · [安装包 SHA256 校验值](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.2/SHA256SUMS.txt)
 
 预览工具栏会避开桌面标题栏的窗口按钮，并随全屏状态调整位置。
 
@@ -36,13 +38,13 @@
 macOS：
 
 ```sh
-dsh plugin --profile desktop add "/absolute/path/dsh-context-snapshot-0.4.1-macos.tgz"
+dsh plugin --profile desktop add "/absolute/path/dsh-context-snapshot-0.4.2-macos.tgz"
 ```
 
 Windows PowerShell：
 
 ```powershell
-dsh plugin --profile desktop add "C:\Downloads\dsh-context-snapshot-0.4.1-windows-x64.tgz"
+dsh plugin --profile desktop add "C:\Downloads\dsh-context-snapshot-0.4.2-windows-x64.tgz"
 ```
 
 macOS 若找不到 `dsh`，可使用 Desktop 自带的 CLI：`/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`。
@@ -53,8 +55,8 @@ Windows 自带 CLI 位于 `<Harness 安装目录>\resources\runtime\cli\bin\dsh.
 
 ## 使用
 
-1. 在 Harness 中打开目标会话，点击输入框工具栏的「▣ 快照」，确认原生程序就绪。
-2. macOS 首次使用时点击「检查 / 授予系统权限」：截图需要屏幕录制权限，读取文字需要辅助功能权限，监听快捷键需要输入监控或辅助功能权限。更改权限后点击「重启原生程序」。
+1. 在 Harness 中打开目标会话，点击输入框工具栏的「快照」，确认显示「已就绪」。
+2. macOS 首次使用时点击「检查权限」：截图需要屏幕录制权限，读取文字需要辅助功能权限，监听快捷键需要输入监控或辅助功能权限。更改权限后点击「重启采集」。
 3. 切换到要引用的应用窗口，同时按下左右 Command（macOS）或左右 Ctrl（Windows）。两键都按下才会触发；松开任一键后可再次捕获。
 4. 返回 Harness，检查草稿中的快照卡片，补充问题后发送。插件不会自动发送或把 Harness 切到前台。
 
