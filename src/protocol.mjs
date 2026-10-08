@@ -1,3 +1,5 @@
+import { cleanAppIcon } from './app-icon.mjs';
+
 export const MAX_PNG_BYTES = 12 * 1024 * 1024;
 export const MAX_TEXT_CHARS = 16000;
 export const MAX_LINE_BYTES = 18 * 1024 * 1024;
@@ -11,7 +13,8 @@ export function validateCapture(value) {
   const width = png.readUInt32BE(16), height = png.readUInt32BE(20);
   if (!width || !height || width > 16384 || height > 16384 || width * height > 80_000_000) throw new Error('Invalid PNG dimensions');
   const clean = (s, limit) => typeof s === 'string' ? s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, limit) : '';
-  return { pngBase64: b64, width, height, title: clean(value.title, 512), appName: clean(value.appName, 256), bundleId: clean(value.bundleId, 256), pid: Number.isSafeInteger(value.pid) ? value.pid : undefined, text: clean(value.text, MAX_TEXT_CHARS), capturedAt: Number.isFinite(Date.parse(value.capturedAt)) ? value.capturedAt : new Date().toISOString() };
+  const appIconPngBase64 = cleanAppIcon(value.appIconPngBase64);
+  return { pngBase64: b64, width, height, title: clean(value.title, 512), appName: clean(value.appName, 256), bundleId: clean(value.bundleId, 256), pid: Number.isSafeInteger(value.pid) ? value.pid : undefined, text: clean(value.text, MAX_TEXT_CHARS), capturedAt: Number.isFinite(Date.parse(value.capturedAt)) ? value.capturedAt : new Date().toISOString(), ...(appIconPngBase64 ? { appIconPngBase64 } : {}) };
 }
 
 /** Bound before JSON.parse; native output is never a command or a file path. */

@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SnapshotBroker } from '../src/broker.mjs';
 import { LineDecoder, validateCapture, MAX_LINE_BYTES } from '../src/protocol.mjs';
-import { attachSnapshot, contextText } from '../src/draft.mjs';
+import { attachSnapshot, captureFile, contextText } from '../src/draft.mjs';
+import { parseSnapshotPresentation } from '../src/presentation-data.mjs';
+import { cleanAppIcon, MAX_APP_ICON_BYTES } from '../src/app-icon.mjs';
 import { createHandler } from '../src/index.mjs';
 import { createController } from '../src/controller.mjs';
 import { createSnapshotStore } from '../src/snapshot-store.mjs';
@@ -43,6 +45,20 @@ test('malformed, oversized and false PNG data is refused before draft intake', (
   assert.throws(() => validateCapture({ ...capture, pngBase64: Buffer.from('not PNG').toString('base64') }));
   assert.throws(() => validateCapture({ ...capture, pngBase64: 'A'.repeat(17 * 1024 * 1024) }));
   assert.equal(validateCapture({ ...capture, text: 'x'.repeat(17000) }).text.length, 16000);
+});
+
+test('optional app icons accept bounded PNGs and degrade without rejecting a valid window capture', () => {
+  assert.equal(cleanAppIcon(pngBase64), pngBase64);
+  assert.equal(validateCapture({ ...capture, appIconPngBase64: pngBase64 }).appIconPngBase64, pngBase64);
+  const oversizedDimensions = Buffer.from(pngBase64, 'base64');
+  oversizedDimensions.writeUInt32BE(129, 16);
+  const invalid = ['https://example.com/icon.png', '<svg/>', 'data:image/png;base64,' + pngBase64,
+    Buffer.alloc(MAX_APP_ICON_BYTES + 1).toString('base64'), oversizedDimensions.toString('base64')];
+  for (const value of invalid) {
+    assert.equal(cleanAppIcon(value), undefined);
+    assert.equal(validateCapture({ ...capture, appIconPngBase64: value }).appIconPngBase64, undefined);
+    assert.equal(validateCapture({ ...capture, appIconPngBase64: value }).pngBase64, pngBase64);
+  }
 });
 
 test('late polls and releases cannot replace a newer composer generation', () => {
@@ -98,6 +114,40 @@ test('snapshot preserves editor text and attaches image and hidden context under
   assert.equal(f.snapshots.get('new-image').sessionId, 'session-A');
   assert.equal(f.snapshots.get('new-image').capture.text, 'hello');
   assert.equal(f.snapshots.get('new-image').capture.pngBase64, undefined, 'image bytes have one owner');
+});
+
+test('source app icon survives draft rebinding and durable metadata without changing screenshot ownership', () => {
+  const f = draftFixture();
+  attachSnapshot(f.conversation, f.target, { ...capture, appIconPngBase64: pngBase64 }, f.snapshots);
+  const metadata = f.snapshots.get('new-image').capture;
+  assert.equal(metadata.appIconPngBase64, pngBase64);
+  assert.equal(metadata.pngBase64, undefined);
+  f.snapshots.add('new-image', 'session-B', metadata);
+  const persisted = f.snapshots.get('new-image').capture;
+  const content = [{ type: 'image', value: { previewUrl: 'blob:fixture', name: captureFile({ ...capture, ...persisted }).name } }, { type: 'text', text: '用户正文' + contextText(persisted) }];
+  const restored = parseSnapshotPresentation(content);
+  assert.equal(restored.text, '用户正文');
+  assert.equal(restored.snapshots[0].appIconPngBase64, pngBase64);
+  assert.equal(restored.snapshots[0].text, capture.text);
+});
+
+test('generated capture identities pair model context with same-second PNGs without changing window data', () => {
+  const files = [];
+  const f = draftFixture();
+  f.conversation.createDrafts = (_session, images) => { files.push(...images); return [{ id: `image-${files.length}` }]; };
+  attachSnapshot(f.conversation, f.target, capture, f.snapshots);
+  attachSnapshot(f.conversation, f.target, capture, f.snapshots);
+  const entries = f.snapshots.entries().map(([, entry]) => entry);
+  assert.notEqual(entries[0].capture.snapshotId, entries[1].capture.snapshotId);
+  assert.equal(capture.snapshotId, undefined, 'native capture data remains unchanged');
+  const blocks = [...files.map(file => ({
+    type: 'image', value: { name: file.name, previewUrl: 'blob:' + file.name },
+  })), { type: 'text', text: '请检查' + entries.map(entry => contextText(entry.capture)).join('') }];
+  const presented = parseSnapshotPresentation(blocks);
+  assert.equal(presented.text, '请检查');
+  assert.deepEqual(presented.snapshots.map(item => item.id), entries.map(entry => entry.capture.snapshotId));
+  assert.equal(presented.snapshots[1].text, capture.text);
+  assert.equal(captureFile(capture).name, 'window-snapshot-2026-10-08T00-00-00Z.png', 'legacy file names remain supported');
 });
 
 test('locked editor or rejected attachment admission leaves no orphan snapshot context', () => {

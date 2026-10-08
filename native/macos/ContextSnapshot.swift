@@ -6,6 +6,8 @@ import Foundation
 import ScreenCaptureKit
 
 private let maximumPNGBytes = 12 * 1024 * 1024
+private let appIconPixels = 32
+private let maximumAppIconPNGBytes = 8 * 1024
 private let maximumTextCharacters = 16_000
 private let helperBundleID = "io.dsh.context-snapshot.helper"
 
@@ -87,41 +89,195 @@ private func axWindowFrame(_ window: AXUIElement?) -> CGRect? {
     return CGRect(origin: point, size: dimensions)
 }
 
-private func boundedText(_ fragments: [String], maximum: Int = maximumTextCharacters) -> String {
-    String(fragments.joined(separator: "\n").prefix(maximum))
+/// Match JavaScript text.length's UTF-16 budget while cutting only at complete
+/// Character boundaries, including emoji sequences and combining marks.
+private func boundedUTF16Text(_ text: String, maximum: Int) -> String {
+    guard maximum > 0 else { return "" }
+    var end = text.startIndex
+    var units = 0
+    while end < text.endIndex {
+        let next = text.index(after: end)
+        let cost = text[end..<next].utf16.count
+        guard cost <= maximum - units else { break }
+        units += cost
+        end = next
+    }
+    return String(text[..<end])
 }
 
-/// Read visible accessibility content with strict node, time and character limits.
-/// Secure text fields are excluded, including their descendants.
+private func boundedText(_ fragments: [String], maximum: Int = maximumTextCharacters) -> String {
+    boundedUTF16Text(fragments.joined(separator: "\n"), maximum: maximum)
+}
+
+/// Attribute errors stay distinguishable from a reported false/empty value.
+private func axAttributeError(_ value: CFTypeRef?) -> AXError? {
+    guard let value, CFGetTypeID(value) == AXValueGetTypeID(),
+          AXValueGetType(value as! AXValue) == .axError else { return nil }
+    var error = AXError.success
+    return AXValueGetValue(value as! AXValue, .axError, &error) ? error : .failure
+}
+
+private func axBatch(_ element: AXUIElement, _ attributes: [String]) -> [String: CFTypeRef]? {
+    var result: CFArray?
+    guard AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &result) == .success,
+          let values = result as? [CFTypeRef], values.count == attributes.count else { return nil }
+    return Dictionary(uniqueKeysWithValues: zip(attributes, values))
+}
+
+private func axBoolean(_ value: CFTypeRef?) -> Bool? {
+    guard let value, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+    return (value as! NSNumber).boolValue
+}
+
+/// Strings are quoted on one line. Never stringify arrays, image data, elements,
+/// or arbitrary provider objects; only known scalar AX values enter the tree.
+private func quotedAXText(_ text: String, maximum: Int = 1024, preserveEmpty: Bool = false) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard preserveEmpty || !trimmed.isEmpty else { return nil }
+    let value = String(trimmed.prefix(maximum)) + (trimmed.count > maximum ? "…" : "")
+    guard let data = try? JSONSerialization.data(withJSONObject: [value]),
+          let encoded = String(data: data, encoding: .utf8) else { return nil }
+    return String(encoded.dropFirst().dropLast())
+}
+
+private func axScalar(_ value: CFTypeRef?, maximum: Int = 1024, preserveEmpty: Bool = false) -> String? {
+    guard let value else { return nil }
+    if CFGetTypeID(value) == CFStringGetTypeID(), let text = value as? String {
+        return quotedAXText(text, maximum: maximum, preserveEmpty: preserveEmpty)
+    }
+    if let flag = axBoolean(value) { return flag ? "true" : "false" }
+    if CFGetTypeID(value) == CFNumberGetTypeID(), let number = value as? NSNumber,
+       number.doubleValue.isFinite { return number.stringValue }
+    if CFGetTypeID(value) == CFURLGetTypeID() {
+        return quotedAXText(CFURLGetString((value as! CFURL)) as String, maximum: maximum)
+    }
+    return nil
+}
+
+private func axSelectedRange(_ value: CFTypeRef?) -> String? {
+    guard let value, CFGetTypeID(value) == AXValueGetTypeID(),
+          AXValueGetType(value as! AXValue) == .cfRange else { return nil }
+    var range = CFRange(location: 0, length: 0)
+    guard AXValueGetValue(value as! AXValue, .cfRange, &range), range.location >= 0,
+          range.length >= 0, range.location <= Int.max - range.length else { return nil }
+    return "location=\(range.location), length=\(range.length)"
+}
+
+private func axCheckedState(role: String, value: CFTypeRef?) -> String? {
+    guard role == "AXCheckBox" || role == "AXRadioButton", let value else { return nil }
+    if let flag = axBoolean(value) { return flag ? "true" : "false" }
+    guard CFGetTypeID(value) == CFNumberGetTypeID(), let number = value as? NSNumber else { return nil }
+    switch number.doubleValue {
+    case 0: return "false"
+    case 1: return "true"
+    case 2 where role == "AXCheckBox": return "mixed"
+    default: return nil
+    }
+}
+
+private func readableAXNode(role: String?, subrole: String?, hidden: Bool?) -> Bool {
+    guard let role, !role.isEmpty else { return false }
+    return role != "AXSecureTextField" && subrole != "AXSecureTextField" && hidden != true
+}
+
+private func optionalAXSafetyValue(_ value: CFTypeRef?, boolean: Bool) -> Bool {
+    if let error = axAttributeError(value) { return error == .attributeUnsupported || error == .noValue }
+    guard let value else { return false }
+    // CopyMultipleAttributeValues documents CFNull for an unavailable optional
+    // attribute. It is not a failed transport read or a fabricated false state.
+    if CFGetTypeID(value) == CFNullGetTypeID() { return true }
+    return boolean ? axBoolean(value) != nil : CFGetTypeID(value) == CFStringGetTypeID()
+}
+
+private func accessibilityTreeLine(role: String, subrole: String?, depth: Int,
+                                   states: [(String, String)], fields: [(String, String)]) -> String {
+    // Pathological provider depth cannot consume the entire budget as indentation.
+    let indent = String(repeating: " ", count: min(max(depth, 0), 24) * 2)
+    let cleanRole = String(role.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(256))
+    let sub = subrole.flatMap { quotedAXText($0, maximum: 256) }.map { " [subrole=\($0)]" } ?? ""
+    let level = depth > 24 ? " [depth=\(depth)]" : ""
+    let state = states.isEmpty ? "" : " (" + states.map { "\($0.0)=\($0.1)" }.joined(separator: ", ") + ")"
+    let values = fields.isEmpty ? "" : ": " + fields.map { "\($0.0): \($0.1)" }.joined(separator: "; ")
+    return indent + cleanRole + sub + level + state + values
+}
+
+private struct AXElementIdentity: Hashable {
+    let element: AXUIElement
+    static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
+    func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }
+}
+
+/// A bounded capture-time AX tree, not OCR or a live inspector. Password and
+/// reported-hidden subtrees are excluded before asking for any text values.
 private func collectWindowText(_ window: AXUIElement?) -> String {
     guard let window, AXIsProcessTrusted() else { return "" }
     AXUIElementSetMessagingTimeout(window, 0.025)
     let deadline = ProcessInfo.processInfo.systemUptime + 1.0
-    var stack = [window]
+    var stack: [(AXUIElement, Int)] = [(window, 0)]
     var fragments: [String] = []
-    var seen = Set<String>()
-    var characterCount = 0
+    var seen = Set<AXElementIdentity>()
+    var textUnits = 0
     var nodeCount = 0
-    while let element = stack.popLast() {
-        guard nodeCount < 300, characterCount < maximumTextCharacters,
+    let securityAttributes = [kAXRoleAttribute, kAXSubroleAttribute, kAXHiddenAttribute].map { $0 as String }
+    let valueAttributes = [kAXTitleAttribute, kAXDescriptionAttribute, kAXRoleDescriptionAttribute,
+        kAXHelpAttribute, kAXValueAttribute, kAXValueDescriptionAttribute, kAXSelectedTextAttribute,
+        kAXSelectedTextRangeAttribute, kAXEnabledAttribute, kAXFocusedAttribute, kAXSelectedAttribute,
+        kAXExpandedAttribute, kAXURLAttribute].map { $0 as String }
+    while let (element, depth) = stack.popLast() {
+        guard nodeCount < 300, textUnits < maximumTextCharacters,
               ProcessInfo.processInfo.systemUptime < deadline else { break }
+        guard seen.insert(AXElementIdentity(element: element)).inserted else { continue }
         nodeCount += 1
-        let role = axString(element, kAXRoleAttribute as CFString) ?? ""
-        let subrole = axString(element, kAXSubroleAttribute as CFString) ?? ""
-        if role == "AXSecureTextField" || subrole == "AXSecureTextField" { continue }
-        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-            guard ProcessInfo.processInfo.systemUptime < deadline else { break }
-            guard let raw = axString(element, attribute as CFString) else { continue }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            let text = String(trimmed.prefix(maximumTextCharacters - characterCount))
-            if !text.isEmpty && seen.insert(text).inserted {
-                fragments.append(text)
-                characterCount += text.count + 1
-            }
-        }
+        AXUIElementSetMessagingTimeout(element, 0.025)
+        guard let security = axBatch(element, securityAttributes) else { continue }
+        let role = security[kAXRoleAttribute as String] as? String
+        let subrole = security[kAXSubroleAttribute as String] as? String
+        // An unsupported/no-value optional attribute is different from a failed
+        // safety read. Skip the subtree when its safety facts cannot be read.
+        guard optionalAXSafetyValue(security[kAXSubroleAttribute as String], boolean: false),
+            optionalAXSafetyValue(security[kAXHiddenAttribute as String], boolean: true),
+            readableAXNode(role: role, subrole: subrole,
+            hidden: axBoolean(security[kAXHiddenAttribute as String])), let role else { continue }
         guard ProcessInfo.processInfo.systemUptime < deadline else { break }
-        if let children = axValue(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
-            stack.append(contentsOf: children.prefix(max(0, 300 - nodeCount)).reversed())
+        let values = axBatch(element, valueAttributes) ?? [:]
+        var states: [(String, String)] = []
+        for (name, attribute) in [("enabled", kAXEnabledAttribute), ("focused", kAXFocusedAttribute),
+            ("selected", kAXSelectedAttribute), ("expanded", kAXExpandedAttribute)] {
+            if let flag = axBoolean(values[attribute as String]) { states.append((name, flag ? "true" : "false")) }
+        }
+        if let checked = axCheckedState(role: role, value: values[kAXValueAttribute as String]) {
+            states.append(("checked", checked))
+        }
+        var fields: [(String, String)] = []
+        for (name, attribute) in [("Title", kAXTitleAttribute), ("Description", kAXDescriptionAttribute),
+            ("Role description", kAXRoleDescriptionAttribute), ("Help", kAXHelpAttribute),
+            ("Value", kAXValueAttribute), ("Value description", kAXValueDescriptionAttribute),
+            ("Selected text", kAXSelectedTextAttribute), ("URL", kAXURLAttribute)] {
+            let maximum = attribute == kAXTitleAttribute ? 256 : 1024
+            if let value = axScalar(values[attribute as String], maximum: maximum,
+                preserveEmpty: attribute == kAXValueAttribute) { fields.append((name, value)) }
+        }
+        if let range = axSelectedRange(values[kAXSelectedTextRangeAttribute as String]) {
+            fields.append(("Selected range", range))
+        }
+        let line = accessibilityTreeLine(role: role, subrole: subrole, depth: depth, states: states, fields: fields)
+        let remaining = maximumTextCharacters - textUnits
+        let bounded = boundedUTF16Text(line, maximum: remaining - (fragments.isEmpty ? 0 : 1))
+        if !bounded.isEmpty { fragments.append(bounded); textUnits += bounded.utf16.count + (fragments.count > 1 ? 1 : 0) }
+        guard nodeCount < 300, textUnits < maximumTextCharacters,
+              ProcessInfo.processInfo.systemUptime < deadline else { continue }
+        // Ask for only the remaining node budget, and use the provider's visible
+        // children when it supports them. Do not expand giant full child arrays.
+        var childValues: CFArray?
+        var childResult = AXUIElementCopyAttributeValues(element, kAXVisibleChildrenAttribute as CFString,
+            0, 300 - nodeCount, &childValues)
+        if childResult == .attributeUnsupported {
+            guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+            childResult = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString,
+                0, 300 - nodeCount, &childValues)
+        }
+        if childResult == .success, let children = childValues as? [AXUIElement] {
+            stack.append(contentsOf: children.reversed().map { ($0, depth + 1) })
         }
     }
     return boundedText(fragments)
@@ -189,6 +345,33 @@ private func pngData(_ image: CGImage) throws -> Data {
         throw CaptureFailure(code: "IMAGE_TOO_LARGE", message: "The PNG exceeds the 12 MiB snapshot limit")
     }
     return data
+}
+
+/// Render the local application icon at a fixed size, retaining transparent padding.
+/// A missing or unencodable icon must not prevent the window snapshot.
+@MainActor
+private func appIconPNGBase64(_ image: NSImage?) -> String? {
+    guard let image, image.size.width.isFinite, image.size.height.isFinite,
+          image.size.width > 0, image.size.height > 0,
+          let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
+            pixelsWide: appIconPixels, pixelsHigh: appIconPixels, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: appIconPixels * 4, bitsPerPixel: 32),
+          let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+    let side = CGFloat(appIconPixels)
+    let scale = min(side / image.size.width, side / image.size.height)
+    let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+    let rect = CGRect(x: (side - size.width) / 2, y: (side - size.height) / 2,
+                      width: size.width, height: size.height)
+    NSGraphicsContext.saveGraphicsState()
+    defer { NSGraphicsContext.restoreGraphicsState() }
+    NSGraphicsContext.current = context
+    context.cgContext.clear(CGRect(x: 0, y: 0, width: side, height: side))
+    context.imageInterpolation = .high
+    image.draw(in: rect, from: .zero, operation: .copy, fraction: 1)
+    guard let data = bitmap.representation(using: .png, properties: [:]),
+          data.count <= maximumAppIconPNGBytes else { return nil }
+    return data.base64EncodedString()
 }
 
 private final class OneFrameCollector: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
@@ -386,13 +569,15 @@ private final class SnapshotHelper: @unchecked Sendable {
             Task { @MainActor in
                 defer { self.capturing = false }
                 do {
+                    let appIcon = appIconPNGBase64(target.app.icon)
                     let image = try await screenshot(target)
                     let data = try pngData(image)
-                    let capture: [String: Any] = ["pngBase64": data.base64EncodedString(), "title": String(target.title.prefix(1024)),
+                    var capture: [String: Any] = ["pngBase64": data.base64EncodedString(), "title": String(target.title.prefix(1024)),
                         "appName": String((target.app.localizedName ?? "").prefix(256)),
                         "bundleId": String((target.app.bundleIdentifier ?? "").prefix(256)),
                         "pid": target.app.processIdentifier, "width": image.width, "height": image.height,
                         "text": text, "capturedAt": ISO8601DateFormatter().string(from: Date())]
+                    if let appIcon { capture["appIconPngBase64"] = appIcon }
                     self.writer.send(["type": "capture", "captureId": id, "capture": capture])
                 } catch { self.sendError(id: id, error: error) }
             }
@@ -415,6 +600,7 @@ private final class SnapshotHelper: @unchecked Sendable {
     }
 }
 
+@MainActor
 private func runSelfTest() throws {
     var chord = DoubleCommandState()
     let events: [(Bool, Bool, Bool)] = [
@@ -430,6 +616,67 @@ private func runSelfTest() throws {
     guard boundedText([String(repeating: "界", count: 20_000)]).count == maximumTextCharacters else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "Text limit failed")
     }
+    let emojis = boundedText([String(repeating: "😀", count: 20_000)])
+    let combining = boundedText([String(repeating: "e\u{301}", count: 20_000)])
+    let joinedEmoji = "👩🏽‍💻"
+    guard emojis.utf16.count == maximumTextCharacters, emojis.count == maximumTextCharacters / 2,
+          combining.utf16.count == maximumTextCharacters, combining.count == maximumTextCharacters / 2,
+          boundedText(["A😀B"], maximum: 2) == "A",
+          boundedText(["A😀B"], maximum: 3) == "A😀",
+          boundedText(["e\u{301}e\u{301}"], maximum: 3) == "e\u{301}",
+          boundedText(["A" + joinedEmoji + "B"], maximum: joinedEmoji.utf16.count) == "A",
+          boundedText(["A" + joinedEmoji + "B"], maximum: joinedEmoji.utf16.count + 1) == "A" + joinedEmoji,
+          boundedText(["a", "😀", "b"], maximum: 4) == "a\n😀",
+          boundedText(["😀"], maximum: 1).isEmpty,
+          boundedText(["text"], maximum: 0).isEmpty else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "UTF-16 limit, newline budget or grapheme boundary failed")
+    }
+    let label = quotedAXText("共享按钮", maximum: 256)!
+    let firstNode = accessibilityTreeLine(role: "AXButton", subrole: nil, depth: 1,
+        states: [("enabled", "true"), ("focused", "false")], fields: [("Title", label)])
+    let secondNode = accessibilityTreeLine(role: "AXButton", subrole: nil, depth: 2,
+        states: [("enabled", "false"), ("focused", "true")], fields: [("Title", label)])
+    let tree = boundedText(["AXWindow", firstNode, secondNode])
+    guard firstNode.hasPrefix("  AXButton (enabled=true, focused=false)"),
+          secondNode.hasPrefix("    AXButton (enabled=false, focused=true)"),
+          tree.components(separatedBy: label).count == 3,
+          accessibilityTreeLine(role: "AXGroup", subrole: nil, depth: 30, states: [], fields: [])
+            .contains("[depth=30]"),
+          boundedText([String(repeating: tree, count: 500)]).count == maximumTextCharacters else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "AX tree hierarchy, state, repeated controls or budget failed")
+    }
+    let quoted = quotedAXText("第一行\n\"第二行\"\t末尾")!
+    guard !quoted.contains("\n"), quoted.contains("\\n"), quoted.contains("\\\""),
+          quotedAXText(String(repeating: "界", count: 1100))?.count == 1027,
+          axScalar(["not", "text"] as CFArray) == nil,
+          axScalar(Data([1, 2, 3]) as CFData) == nil,
+          axScalar(NSNumber(value: Double.nan)) == nil,
+          axScalar(kCFBooleanFalse) == "false",
+          axScalar("" as CFString, preserveEmpty: true) == "\"\"",
+          axScalar(NSNumber(value: 42)) == "42",
+          axCheckedState(role: "AXCheckBox", value: NSNumber(value: 2)) == "mixed",
+          axCheckedState(role: "AXRadioButton", value: NSNumber(value: 2)) == nil,
+          axCheckedState(role: "AXSlider", value: NSNumber(value: 1)) == nil else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "AX safe scalar, quoting, bounds or checked-state failed")
+    }
+    var selectedRange = CFRange(location: 3, length: 2)
+    var missingAttribute = AXError.attributeUnsupported
+    var failedAttribute = AXError.cannotComplete
+    guard let selectedValue = AXValueCreate(.cfRange, &selectedRange),
+          let missingValue = AXValueCreate(.axError, &missingAttribute),
+          let failedValue = AXValueCreate(.axError, &failedAttribute),
+          axSelectedRange(selectedValue) == "location=3, length=2",
+          optionalAXSafetyValue(missingValue, boolean: true),
+          optionalAXSafetyValue(kCFNull, boolean: true),
+          !optionalAXSafetyValue(failedValue, boolean: true),
+          !optionalAXSafetyValue(NSNumber(value: 123), boolean: true),
+          !readableAXNode(role: "AXSecureTextField", subrole: nil, hidden: false),
+          !readableAXNode(role: "AXTextField", subrole: "AXSecureTextField", hidden: false),
+          !readableAXNode(role: "AXTextField", subrole: nil, hidden: true),
+          !readableAXNode(role: nil, subrole: nil, hidden: false),
+          readableAXNode(role: "AXTextField", subrole: nil, hidden: false) else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "AX selection or fail-closed privacy policy failed")
+    }
     guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8,
         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 8, bitsPerPixel: 32),
         let image = bitmap.cgImage else {
@@ -439,7 +686,27 @@ private func runSelfTest() throws {
     guard png.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]), png.count <= maximumPNGBytes else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "PNG encoding failed")
     }
-    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "unicode-text-limit", "png-encoding"]])
+    guard let iconBitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 128, pixelsHigh: 64,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 128 * 4, bitsPerPixel: 32),
+        let iconContext = NSGraphicsContext(bitmapImageRep: iconBitmap) else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "App icon fixture allocation failed")
+    }
+    iconContext.cgContext.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+    iconContext.cgContext.fill(CGRect(x: 0, y: 0, width: 128, height: 64))
+    let iconImage = NSImage(size: NSSize(width: 128, height: 64))
+    iconImage.addRepresentation(iconBitmap)
+    guard let iconBase64 = appIconPNGBase64(iconImage), let iconPNG = Data(base64Encoded: iconBase64),
+          iconPNG.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
+          iconPNG.count <= maximumAppIconPNGBytes, let decodedIcon = NSBitmapImageRep(data: iconPNG),
+          decodedIcon.pixelsWide == appIconPixels, decodedIcon.pixelsHigh == appIconPixels,
+          let center = decodedIcon.colorAt(x: appIconPixels / 2, y: appIconPixels / 2),
+          let corner = decodedIcon.colorAt(x: 0, y: 0), center.alphaComponent > 0.99,
+          corner.alphaComponent < 0.01, appIconPNGBase64(nil) == nil,
+          appIconPNGBase64(NSImage(size: .zero)) == nil else {
+        throw CaptureFailure(code: "SELF_TEST_FAILED", message: "App icon encoding, bounds or fallback failed")
+    }
+    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "unicode-text-limit", "utf16-emoji-limit", "utf16-grapheme-and-newline-boundaries", "ax-tree-hierarchy-and-repeated-controls", "ax-provider-states", "ax-selection-range", "ax-safe-scalars-and-string-bounds", "ax-password-hidden-and-failed-safety-exclusion", "png-encoding", "app-icon-png-bounds", "app-icon-transparent-padding", "app-icon-optional-fallback"]])
 }
 
 if CommandLine.arguments.contains("--self-test") {

@@ -1,12 +1,15 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Windows.Automation;
+using System.Windows.Automation.Text;
 using System.Windows.Forms;
 
 namespace DshContextSnapshot;
@@ -16,6 +19,8 @@ internal static class Program
     private const int MaxPngBytes = 12 * 1024 * 1024;
     private const int MaxTextChars = 16_000;
     private const int MaxNodes = 300;
+    private const int AppIconPixels = 32;
+    private const int MaxAppIconPngBytes = 8 * 1024;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private static readonly object OutputLock = new();
     private static readonly object WorkerLock = new();
@@ -50,6 +55,22 @@ internal static class Program
             }
         }
         if (args is ["--extract-text", var textHandle]) return ExtractTextWorker(ParseHandle(textHandle));
+        if (args is ["--extract-icon", var iconHandle, var iconProcess])
+        {
+            string? encoded = null;
+            try
+            {
+                using var process = Process.GetProcessById(int.Parse(iconProcess, CultureInfo.InvariantCulture));
+                encoded = ReadAppIcon(ParseHandle(iconHandle), process);
+            }
+            catch (Exception exception)
+            {
+                // The optional icon worker reports absence if its owner went away.
+                _ = exception;
+            }
+            Write(new IconResult(encoded));
+            return 0;
+        }
         if (args.Length != 0)
         {
             Console.Error.WriteLine("Usage: ContextSnapshot.exe [--self-test]");
@@ -224,6 +245,7 @@ internal static class Program
         var title = new StringBuilder(4096);
         Native.GetWindowText(target, title, title.Capacity);
         using var process = Process.GetProcessById((int)processId);
+        var iconWorker = ReadAppIconWorker(target, processId);
         var textWorker = RunWorker(1000, "--extract-text", HandleString(target)).GetAwaiter().GetResult();
         var text = "";
         string[] warnings = [];
@@ -235,7 +257,102 @@ internal static class Program
             catch (JsonException) { warnings = ["ui_automation_unavailable"]; }
         }
         return new CaptureData(Convert.ToBase64String(stream.ToArray()), title.ToString(), process.ProcessName,
-            (int)processId, image.Width, image.Height, text[..Math.Min(text.Length, MaxTextChars)], DateTime.UtcNow.ToString("O"), warnings);
+            (int)processId, image.Width, image.Height, text[..Math.Min(text.Length, MaxTextChars)], DateTime.UtcNow.ToString("O"), warnings,
+            iconWorker.GetAwaiter().GetResult());
+    }
+
+    private static async Task<string?> ReadAppIconWorker(nint target, uint processId)
+    {
+        try
+        {
+            // Optional resource/GDI reads are isolated from the completed PNG.
+            // This worker overlaps UI Automation and cannot block it indefinitely.
+            var worker = await RunWorker(400, "--extract-icon", HandleString(target), processId.ToString(CultureInfo.InvariantCulture));
+            if (worker.TimedOut || worker.ExitCode != 0) return null;
+            return JsonSerializer.Deserialize<IconResult>(worker.Output, JsonOptions)?.AppIconPngBase64;
+        }
+        catch (Exception exception)
+        {
+            // Spawn, serialization, and icon-process failures keep the window PNG.
+            _ = exception;
+            return null;
+        }
+    }
+
+    private static string? ReadAppIcon(nint target, Process process)
+    {
+        try
+        {
+            Native.GetWindowThreadProcessId(target, out var owner);
+            if (owner != process.Id) return null;
+            // WM_GETICON can enter the application's thread. Keep each attempt
+            // bounded inside the already deadline-owned capture subprocess.
+            // ICON_SMALL2 can substitute a system-generated default; use only
+            // the application's explicit large/small icon before other sources.
+            foreach (var kind in new nuint[] { 1, 0 })
+            {
+                if (Native.SendMessageTimeout(target, 0x7F, kind, 0, 0x22, 80, out var handle) != 0 && handle != 0)
+                {
+                    var encoded = EncodeBorrowedIcon((nint)handle);
+                    if (encoded != null) return encoded;
+                }
+            }
+            foreach (var attribute in new[] { -14, -34 })
+            {
+                var handle = Native.GetClassLongPtr(target, attribute);
+                if (handle == 0) continue;
+                var encoded = EncodeBorrowedIcon(handle);
+                if (encoded != null) return encoded;
+            }
+            var path = process.MainModule?.FileName;
+            if (string.IsNullOrEmpty(path) || path.StartsWith(@"\\", StringComparison.Ordinal)) return null;
+            var drive = Path.GetPathRoot(path);
+            if (string.IsNullOrEmpty(drive) || new DriveInfo(drive).DriveType == DriveType.Network) return null;
+            using var associated = Icon.ExtractAssociatedIcon(path);
+            return associated == null ? null : EncodeAppIcon(associated);
+        }
+        catch (Exception exception)
+        {
+            // Optional foreground-app metadata must never invalidate its image
+            // because of process permissions, disposed windows, or icon resources.
+            _ = exception;
+            return null;
+        }
+    }
+
+    private static string? EncodeBorrowedIcon(nint handle)
+    {
+        try
+        {
+            // Window/class HICONs belong to the source application. FromHandle
+            // is non-owning; only the independent clone is disposed as an owner.
+            using var borrowed = Icon.FromHandle(handle);
+            using var clone = (Icon)borrowed.Clone();
+            return EncodeAppIcon(clone);
+        }
+        catch (Exception exception)
+        {
+            // A stale or malformed icon can fall through to the executable icon.
+            _ = exception;
+            return null;
+        }
+    }
+
+    private static string? EncodeAppIcon(Icon icon)
+    {
+        using var source = icon.ToBitmap();
+        using var image = new Bitmap(AppIconPixels, AppIconPixels, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(image))
+        {
+            graphics.Clear(Color.Transparent);
+            graphics.CompositingMode = CompositingMode.SourceCopy;
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.DrawImage(source, new Rectangle(0, 0, AppIconPixels, AppIconPixels));
+        }
+        using var stream = new MemoryStream();
+        image.Save(stream, ImageFormat.Png);
+        return stream.Length <= MaxAppIconPngBytes ? Convert.ToBase64String(stream.ToArray()) : null;
     }
 
     private static uint ValidateTarget(nint target)
@@ -288,19 +405,51 @@ internal static class Program
     {
         var clock = Stopwatch.StartNew();
         var root = AutomationElement.FromHandle(target);
-        var output = new StringBuilder(MaxTextChars);
+        var output = new SnapshotTextTree(MaxTextChars, MaxNodes, 40);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var walker = TreeWalker.ControlViewWalker;
-        var nodes = 0;
-        bool WithinBudget() => clock.ElapsedMilliseconds < 850 && nodes < MaxNodes && output.Length < MaxTextChars;
-        void Add(string? value)
+        var privacy = new CacheRequest { TreeScope = TreeScope.Element };
+        privacy.Add(AutomationElement.IsPasswordProperty);
+        privacy.Add(AutomationElement.IsOffscreenProperty);
+        privacy.Add(AutomationElement.RuntimeIdProperty);
+        var details = new CacheRequest { TreeScope = TreeScope.Element };
+        foreach (var property in new[]
         {
-            if (string.IsNullOrWhiteSpace(value) || output.Length >= MaxTextChars) return;
-            var bounded = value.Trim();
-            bounded = bounded[..Math.Min(bounded.Length, MaxTextChars - output.Length)];
-            if (!seen.Add(bounded)) return;
-            if (output.Length != 0 && output.Length < MaxTextChars) output.Append('\n');
-            output.Append(bounded.AsSpan(0, Math.Min(bounded.Length, MaxTextChars - output.Length)));
+            AutomationElement.ControlTypeProperty, AutomationElement.NameProperty, AutomationElement.HelpTextProperty,
+            AutomationElement.IsEnabledProperty, AutomationElement.HasKeyboardFocusProperty,
+            ValuePattern.ValueProperty, ValuePattern.IsReadOnlyProperty,
+            RangeValuePattern.ValueProperty, RangeValuePattern.MinimumProperty, RangeValuePattern.MaximumProperty,
+            RangeValuePattern.IsReadOnlyProperty, SelectionItemPattern.IsSelectedProperty,
+            ExpandCollapsePattern.ExpandCollapseStateProperty, TogglePattern.ToggleStateProperty,
+        }) details.Add(property);
+        var nodes = 0;
+        bool WithinBudget() => clock.ElapsedMilliseconds < 650 && nodes < MaxNodes && output.CanAppend;
+        object? Cached(AutomationElement element, AutomationProperty property, bool ignoreDefaultValue = true)
+        {
+            try
+            {
+                // Displayed fields omit unsupported properties. Only privacy
+                // reads opt into UIA's documented IsPassword/IsOffscreen FALSE
+                // defaults; an exception still returns null and fails closed.
+                var value = element.GetCachedPropertyValue(property, ignoreDefaultValue);
+                return ReferenceEquals(value, AutomationElement.NotSupported) ? null : value;
+            }
+            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
+            { return null; }
+        }
+        string? ReadRanges(TextPatternRange[] ranges)
+        {
+            var text = new StringBuilder();
+            foreach (var range in ranges)
+            {
+                if (!WithinBudget() || text.Length >= SnapshotTextTree.FieldChars) break;
+                var value = range.GetText(SnapshotTextTree.FieldChars - text.Length);
+                if (value.Length == 0) continue;
+                if (text.Length != 0 && text.Length < SnapshotTextTree.FieldChars) text.Append('\n');
+                var remaining = SnapshotTextTree.FieldChars - text.Length;
+                text.Append(value.AsSpan(0, Math.Min(value.Length, remaining)));
+            }
+            return text.Length == 0 ? null : text.ToString();
         }
         void Visit(AutomationElement element, int depth)
         {
@@ -308,20 +457,65 @@ internal static class Program
             nodes++;
             try
             {
-                var properties = element.Current;
-                if (properties.IsPassword) return;
-                if (!properties.IsPassword && !properties.IsOffscreen)
+                var guarded = element.GetUpdatedCache(privacy);
+                // Privacy and visibility are fail closed for the whole subtree;
+                // no labels, values, text, or child enumeration happen first.
+                if (!SnapshotPrivacy.CanRead(Cached(guarded, AutomationElement.IsPasswordProperty, ignoreDefaultValue: false) as bool?,
+                    Cached(guarded, AutomationElement.IsOffscreenProperty, ignoreDefaultValue: false) as bool?)) return;
+                if (Cached(guarded, AutomationElement.RuntimeIdProperty) is int[] identity && identity.Length is > 0 and <= 64 &&
+                    !seen.Add(string.Join(",", identity))) return;
+                if (!WithinBudget()) return;
+                var properties = element.GetUpdatedCache(details);
+                var node = new SnapshotNode
                 {
-                    Add(properties.Name);
-                    if (WithinBudget() && element.TryGetCurrentPattern(ValuePattern.Pattern, out var value))
-                        Add(((ValuePattern)value).Current.Value);
-                    if (WithinBudget() && element.TryGetCurrentPattern(TextPattern.Pattern, out var text))
-                        foreach (var range in ((TextPattern)text).GetVisibleRanges())
-                        {
-                            if (!WithinBudget()) break;
-                            Add(range.GetText(MaxTextChars - output.Length));
-                        }
+                    Role = (Cached(properties, AutomationElement.ControlTypeProperty) as ControlType)?.ProgrammaticName.Replace("ControlType.", "", StringComparison.Ordinal),
+                    Name = Cached(properties, AutomationElement.NameProperty) as string,
+                    Help = Cached(properties, AutomationElement.HelpTextProperty) as string,
+                    Value = Cached(properties, ValuePattern.ValueProperty) as string,
+                    Enabled = Cached(properties, AutomationElement.IsEnabledProperty) as bool?,
+                    Focused = Cached(properties, AutomationElement.HasKeyboardFocusProperty) as bool?,
+                    Selected = Cached(properties, SelectionItemPattern.IsSelectedProperty) as bool?,
+                    ReadOnly = Cached(properties, ValuePattern.IsReadOnlyProperty) as bool? ??
+                        Cached(properties, RangeValuePattern.IsReadOnlyProperty) as bool?,
+                    Checked = Cached(properties, TogglePattern.ToggleStateProperty) is ToggleState toggle ? toggle switch
+                    {
+                        ToggleState.Off => SnapshotToggleState.Off,
+                        ToggleState.On => SnapshotToggleState.On,
+                        ToggleState.Indeterminate => SnapshotToggleState.Mixed,
+                        _ => null,
+                    } : null,
+                    Expanded = Cached(properties, ExpandCollapsePattern.ExpandCollapseStateProperty) is ExpandCollapseState expand ? expand switch
+                    {
+                        ExpandCollapseState.Collapsed => SnapshotExpandState.Collapsed,
+                        ExpandCollapseState.Expanded => SnapshotExpandState.Expanded,
+                        ExpandCollapseState.PartiallyExpanded => SnapshotExpandState.Partial,
+                        ExpandCollapseState.LeafNode => SnapshotExpandState.Leaf,
+                        _ => null,
+                    } : null,
+                };
+                if (Cached(properties, RangeValuePattern.ValueProperty) is double rangeValue &&
+                    Cached(properties, RangeValuePattern.MinimumProperty) is double minimum &&
+                    Cached(properties, RangeValuePattern.MaximumProperty) is double maximum)
+                    node = node with { Range = new SnapshotRange(rangeValue, minimum, maximum) };
+                // Optional text/selection providers can fail independently of
+                // the primitive fields. Keep the captured node in that case.
+                try
+                {
+                    if (WithinBudget() && element.TryGetCurrentPattern(TextPattern.Pattern, out var text) && text is TextPattern pattern)
+                    {
+                        node = node with { Text = ReadRanges(pattern.GetVisibleRanges()) };
+                        if (WithinBudget() && pattern.SupportedTextSelection != SupportedTextSelection.None)
+                            node = node with { SelectedText = ReadRanges(pattern.GetSelection()) };
+                    }
                 }
+                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
+                try
+                {
+                    if (WithinBudget() && element.TryGetCurrentPattern(SelectionPattern.Pattern, out var selection) && selection is SelectionPattern pattern)
+                        node = node with { SelectionCount = pattern.Current.GetSelection().Length };
+                }
+                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
+                output.Append(node, depth);
                 var child = WithinBudget() ? walker.GetFirstChild(element) : null;
                 while (child != null && WithinBudget())
                 {
@@ -329,8 +523,7 @@ internal static class Program
                     child = WithinBudget() ? walker.GetNextSibling(child) : null;
                 }
             }
-            catch (ElementNotAvailableException) { }
-            catch (InvalidOperationException) { }
+            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
         }
         Visit(root, 0);
         return output.ToString();
@@ -420,14 +613,36 @@ internal static class Program
             Assert(ResolveControl(0x11, 0) == ControlKey.Left, "Non-extended generic Ctrl is left Ctrl.");
             var intersection = Intersect(new Native.Rect(0, 0, 100, 100), new Native.Rect(10, 20, 90, 80));
             Assert(intersection.Width == 80 && intersection.Height == 60, "Crop must remain within the target window.");
+            using var iconSource = new Bitmap(16, 16, PixelFormat.Format32bppArgb);
+            using (var graphics = Graphics.FromImage(iconSource))
+            {
+                graphics.Clear(Color.Transparent);
+                graphics.FillRectangle(Brushes.DodgerBlue, 4, 4, 8, 8);
+            }
+            var syntheticHandle = iconSource.GetHicon();
+            try
+            {
+                var encodedIcon = EncodeBorrowedIcon(syntheticHandle);
+                Assert(!string.IsNullOrEmpty(encodedIcon), "An available app icon must produce PNG data.");
+                var iconBytes = Convert.FromBase64String(encodedIcon!);
+                Assert(iconBytes.Length <= MaxAppIconPngBytes, "App icon PNG must stay within 8 KiB.");
+                using var iconStream = new MemoryStream(iconBytes);
+                using var decodedIcon = new Bitmap(iconStream);
+                Assert(decodedIcon.Width == AppIconPixels && decodedIcon.Height == AppIconPixels, "App icons must be bounded to 32 pixels.");
+                Assert(decodedIcon.GetPixel(0, 0).A == 0, "App icon transparency must survive PNG encoding.");
+            }
+            finally { Native.DestroyIcon(syntheticHandle); }
+            Assert(EncodeBorrowedIcon(0) == null, "An unavailable app icon must be optional.");
             Write(new { type = "self-test", ok = true, checks });
             return 0;
         }
         catch (Exception exception) { Write(new { type = "self-test", ok = false, checks, error = exception.Message }); return 1; }
     }
 
-    private sealed record CaptureData(string PngBase64, string Title, string AppName, int Pid, int Width, int Height, string Text, string CapturedAt, string[] Warnings);
+    private sealed record CaptureData(string PngBase64, string Title, string AppName, int Pid, int Width, int Height, string Text, string CapturedAt, string[] Warnings,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AppIconPngBase64);
     private sealed record TextResult(string Text);
+    private sealed record IconResult(string? AppIconPngBase64);
     private sealed record WorkerError(string Code, string Message);
     private sealed record WorkerResult(string Output, int ExitCode, bool TimedOut);
     private sealed class CaptureException(string code, string message) : Exception(message) { public string Code { get; } = code; }
@@ -454,6 +669,9 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(nint window, out uint processId);
     [DllImport("user32.dll")] internal static extern bool GetWindowRect(nint window, out Rect rectangle);
     [DllImport("user32.dll")] internal static extern bool PrintWindow(nint window, nint deviceContext, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern nint SendMessageTimeout(nint window, uint message, nuint wParam, nint lParam, uint flags, uint timeout, out nuint result);
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")] internal static extern nint GetClassLongPtr(nint window, int attribute);
+    [DllImport("user32.dll")] internal static extern bool DestroyIcon(nint icon);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(nint window, StringBuilder text, int maximum);
     [DllImport("user32.dll")] internal static extern bool PostThreadMessage(uint thread, uint message, nuint wParam, nint lParam);
     [DllImport("user32.dll")] internal static extern bool PeekMessage(out Message message, nint window, uint minimum, uint maximum, uint flags);

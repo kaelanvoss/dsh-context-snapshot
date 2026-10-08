@@ -12,6 +12,7 @@ import { installSnapshotSubmission } from '../src/submission.mjs';
 import { apply as applyHost } from '../src/index.mjs';
 import { SnapshotBroker } from '../src/broker.mjs';
 import { NativeBridge } from '../src/native.mjs';
+import { parseSnapshotPresentation } from '../src/presentation-data.mjs';
 
 const require = createRequire(import.meta.url);
 const portableFixture = new URL('../.fixtures/ui-conversation/client.js', import.meta.url);
@@ -214,6 +215,29 @@ test('attachment-only official Enter submission adds hidden context and preserve
   assert.equal(imageOf(f.calls[0]).data, screenshot.pngBase64);
   assert.equal(f.calls[0].mode, 'steer');
   assert.ok(f.calls[0].signal instanceof AbortSignal);
+  await f.dispose();
+});
+
+test('real official pre-paint echo projects the user body while the model payload retains image, source and AX', { skip: !hasOfficialFixture }, async () => {
+  const f = createOfficialInput(officialRuntime());
+  attachSnapshot(f.conversation, f.target, screenshot, f.store);
+  const ids = [...f.input.state.getSnapshot().attachmentIds];
+  const sending = f.conversation.sendSession(f.session, '请检查', ids, 'queue');
+  assert.equal(f.echoes.length, 1, 'official optimistic echo is synchronous');
+  assert.equal(f.calls.length, 0, 'model transport has not started before nextPaint');
+  const echo = f.echoes[0];
+  const serialized = JSON.stringify(echo);
+  const projection = parseSnapshotPresentation(echo);
+  assert.equal(projection.text, '请检查');
+  assert.equal(projection.snapshots[0].text, screenshot.text);
+  assert.equal(projection.snapshots[0].image, echo.attachments[0]);
+  assert.equal(JSON.stringify(echo), serialized, 'view projection leaves the optimistic source untouched');
+  await sending;
+  assert.equal(imageOf(f.calls[0]).data, screenshot.pngBase64);
+  assert.equal(imageOf(f.calls[0]).name, projection.snapshots[0].filename);
+  assert.match(textOf(f.calls[0]), /Accessible reference text/);
+  assert.match(textOf(f.calls[0]), /Contract fixture/);
+  assert.match(textOf(f.calls[0]), /"dshSnapshot":\{"version":2,"id":/);
   await f.dispose();
 });
 

@@ -24,5 +24,8 @@ async function fetchFixture(name, sourcePath, destination) {
 await Promise.all([
   fetchFixture('dsh-client-ui-conversation', 'lib/client.js', '.fixtures/ui-conversation/client.js'),
   fetchFixture('dsh-client-connection', 'lib/types/rpc.d.ts', '.fixtures/connection/rpc.d.ts'),
+  fetchFixture('dsh-client-ui-slots', 'lib/index.js', '.fixtures/ui-slots/index.js'),
+  fetchFixture('dsh-client-ui-renderer', 'lib/client.js', '.fixtures/ui-renderer/client.js'),
+  fetchFixture('dsh-client-ui-chat', 'lib/client.js', '.fixtures/ui-chat/client.js'),
 ]);
-console.log('Fetched integrity-checked official 0.2.0-rc.2 input implementation and Connection contract.');
+console.log('Fetched integrity-checked official 0.2.0-rc.2 input, chat, slots, renderer and Connection contracts.');

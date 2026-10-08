@@ -4,6 +4,7 @@ import { createSnapshotStore } from './snapshot-store.mjs';
 import { installSnapshotSubmission } from './submission.mjs';
 import { SnapshotAttachments } from './SnapshotAttachments.jsx';
 import { discardSnapshotDrafts } from './draft.mjs';
+import { installSnapshotPresentation } from './presentation.jsx';
 
 export const inject = ['slots', 'conversation', 'sessions'];
 
@@ -44,12 +45,13 @@ function SnapshotControl({ ctx, controller, sessionId, inputActions, useInput })
       {(status.error || status.message) && <p role="status">{status.error || status.message}</p>}
       <button type="button" disabled={pending} onClick={permissions}>检查 / 授予系统权限</button>{' '}
       <button type="button" disabled={pending} onClick={restart}>重启原生程序</button>
-      <p style={{ opacity: .7, marginBottom: 0 }}>快照不会自动发送。点击卡片可预览；移除卡片会同时移除图片和窗口上下文。</p>
+      <p style={{ opacity: .7, marginBottom: 0 }}>快照不会自动发送。点击卡片可查看大图和捕获时的可访问性文本；移除草稿卡片会同时移除图片和窗口上下文。</p>
     </div>}
   </span>;
 }
 
 export function apply(ctx) {
+  const stopPresentation = installSnapshotPresentation(ctx);
   const snapshots = createSnapshotStore();
   const stopSubmission = installSnapshotSubmission(ctx, snapshots);
   const controller = createController(ctx.conversation, request, {}, snapshots);
@@ -72,5 +74,6 @@ export function apply(ctx) {
     controller.dispose();
     discardSnapshotDrafts(ctx.conversation, ctx.sessions, snapshots);
     await stopSubmission();
+    stopPresentation();
   });
 }

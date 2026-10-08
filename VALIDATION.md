@@ -1,46 +1,70 @@
-# 0.2.0 验证记录
+# 0.4.0 本地验证记录
 
-验证日期：2026-10-08。状态：`0.2.0` 已完成独立草稿卡片、发送适配与本地回归，尚待用户在真实 Desktop 安装新版验收。用户提供的 `0.1.0` 实测已证明 macOS 快照采集、会话发送与文本读取基础链路成立。Windows 仍待实机验收。
+验证日期：2026-10-08。以下结果在源码提交、推送前取得，安装包在本地生成；后续源码同步不等同于发布 Release、上传安装包或通过远程 CI。本版新增快照图片/文本预览与有限预算的结构化 AX/UIA 采集。以下首节为新版结果；后面的 0.3.3 记录保留作为历史基线，不代表当前交互。
 
-| 项目 | 已取得证据 |
-| --- | --- |
-| Host / Client 构建 | Node 24.16.0 + esbuild，ESM Host / 官方 ModuleLoader Client |
-| JavaScript 回归 | 35/35 通过，0 skipped；含会话归属、乱序与释放租约、重复投递、隐藏上下文、草稿恢复、进程故障、EPIPE、消息大小边界 |
-| 官方 npm 输入框与发送链路 | 合同与故障回归 21/21；直接运行 `@deepseek-ai/dsh-client-ui-conversation@0.2.0-rc.2` 发布实现中的 Lexical、SessionInputShell、ConversationController，真实 FileReader 编码 PNG（测试仅补 Node 平台 FileReader 实现）；验证正文不插块、引用 chip 序列化、仅附件 Enter、queue / steer、失败 / 重试 / 新输入保留、成功 admission 清理、删除、会话迁移、误会话拒绝、指令保护、scope / signal 和插件卸载（含等待指令判定时的忙态清理） |
-| 独立卡片界面 | IAB 中用合成图片实际检查深 / 浅色、两张卡、原图预览、文字默认折叠 / 展开、Escape / 遮罩关闭、焦点恢复 / Tab 循环、单卡删除、普通文件重试、模拟提交时禁止删除；控制台无 error / warn。这是独立预览，未替代真实 Harness 验收 |
-| macOS helper | Swift 6.3.2 / Swift 6 模式，macOS 13 deployment target；arm64 与 x86_64 双架构编译、当前 arm64 自测、plist / shell 检查通过 |
-| Windows helper | .NET SDK 8.0.425 在 macOS 跨编译：0 warnings / 0 errors；同源纯 C# 策略自检 20/20；win-x64 与 win-arm64 自包含发布成功 |
-| 打包与 bundle | 分别生成 macOS / Windows x64 / Windows ARM64 npm tarball；实际构建的 Client ModuleLoader 在真实 Cordis tracking 下注册两个插槽并正确委托普通附件 renderer；Host Fetch 路由合同通过，安装包内容清单核对通过 |
+## 0.4.0 改动与验收
 
-合同来源：[官方仓库](https://github.com/deepseek-ai/deepseek-harness)，源码 HEAD `5badb15009ae1756c3afe0ae0cef1faafc290ccc`（`0.2.1-alpha.1`），以及 npm 固定 `0.2.0-rc.2` 发布包。
+- 草稿、发送中、历史和 steering 的快照卡片支持点击或键盘打开大图；有文字时可切换到保存的纯文本，保留控件层级及系统可获取状态。纯文本不会执行 HTML/Markdown；预览不会再次采集、运行 OCR 或调用模型。
+- 图片预览提供缩放、适应窗口、拖动、截图下载和同组快照左右切换；文本模式隐藏缩放，下载仍保存图片。关闭、Esc、遮罩及关闭重开行为纳入验证。普通图片继续使用原 gallery；草稿移除与预览动作独立。
+- 新捕获文字由 AX/UIA 按层级提供角色、名称/描述、值和可支持的状态。保留安全过滤、300 节点/16k UTF-16 单位/时间预算；超限部分截断。同名控件不再全局去重。旧快照可预览保存的平铺文字，不能补回旧版未采集的状态。
+- 卡片与文本面板跟随 Harness 主题，图片原像素不变。窗口图/AX 由同次请求获取，但不是原子同步读数。
+- 底层依旧使用原普通消息及附件链路，UI 中隐藏上下文块。原始轨迹、导出或停用插件后可看到序列化上下文。
+- 全量 JavaScript 回归 77/77 通过，0 failed / skipped；新增 9 项预览行为回归直接运行官方 renderer/SlotRegistry。Host 与 Client 编译成功，实际 dist/client.js 在官方 ModuleLoader、Cordis、SlotRegistry 中启用及卸载通过，Chat 入口始终一个，原组件恢复。
+- macOS 已从新版源码重新构建 universal helper，arm64 15 类无截图自检通过；包括层级、重复控件、真假/混合状态、选区、安全标量、密码/hidden/读取失败，以及 emoji/组合字符/ZWJ 和片段换行的 UTF-16 边界。总文本长度与 JS 协议一致，不切开字素。没有实际捕获窗口或触发系统授权。
+- Windows x64 / ARM64 从新版源码重新构建及自包含发布，均零警告、零错误，各运行 45 项纯检查通过；对应 .NET Runtime / Windows Desktop 8.0.31 许可与声明由构建脚本收集。Windows GDI 原生 22 项自测和真实 UIA 采集没有在 macOS 执行。
+- IAB 使用本地合成像素/状态和官方 Harness 主题样式，检查草稿与历史图片/文本切换、120%/144% 缩放、Ctrl+滚轮、拖动、多卡切换重置、关闭重开、焦点循环和 Esc 后恢复焦点与页面滚动。浅色文本面板为 rgb(245,246,247)/rgb(15,17,21)，深色为 rgb(53,54,56)/rgb(249,250,251)；激活的文本按钮使用官方蓝色强调变量，避免深色主题的黑白主品牌色使文字不可见。窄屏和桌面尺寸都已检查，正文不出现 XML，console 无 error/warn。
+- 浏览器初次检查复现“点击/拖动大图误关闭”：指针捕获设在遮罩使最终 click 的 target 变成遮罩。修复为图片自身捕获，图上点击/放大后拖动均保持 dialog，焦点留在 dialog，滚动位置确实变化。下载 URL 和 WebP 文件名通过行为回归，JPEG 按实际 MIME 命名的实现已检查；IAB 未返回 download 完成事件，实际文件保存仍需真实 Harness Desktop 验收。
+- 卡片和预览仍需安装新版后在真实 Harness 验收，包括新窗口 AX/UIA 状态完整度、首次权限、Intel/macOS13、Windows多屏/DPI等；没有把合成预览或跨编译当作这些验收。没有运行模型请求，也没有把用户私有窗口内容写入源码、fixture 或分发包。
 
-公开发布准备：锁文件中 33 个私有镜像地址已与公开 npm 的对应版本、integrity 核对并替换，依赖版本未升级；干净源码目录 `npm ci`、构建和 35 项回归通过。Git 仓库不含依赖、fixture 或原生编译产物，打包默认输出 `artifacts/`。Windows 发布收集本次 MSBuild 实际解析的 Runtime / Windows Desktop 许可证与对应版本 WPF 声明，缺失声明会阻止打包。GitHub 分支检查与 tag Release 工作流已配置；其是否实际通过以 GitHub Actions 记录为准。
+## 0.3.3 历史验证记录
 
-主要接入点为 `connection.fetch.register`、`conversation.input.left / conversation.input.attachments` slot、公开 props `sessionId / inputActions`、`conversation.createDrafts / releaseDraftAttachment`、`InputActions.addAttachments`。发送适配通过 Cordis `reflect.accessor` 包装已发布的 `ConversationController.sendSession / serializeDraftAttachments / rebindDraftFiles / releaseDraftAttachment` 方法，保留原始 receiver、mode 和 signal；不再调用 `insertText / persistDraft`。Host 路由继承 Harness 的认证和 Origin / Host 校验，不开独立无认证截图端口。
+验证日期：2026-10-08。本次修改仅在本地构建，未提交、推送或更新 GitHub Release、附件和远程信息。`0.3.3` 仅调整 UI 主题适配，真实 Harness Desktop 的主题切换验收仍待用户完成。
 
-开发阶段未修改用户真实 `.dsh` profile，也未安装插件或截取真实窗口；自动测试图像为合成 1×1 PNG。随后用户自行安装并完成了下述真实 Desktop 测试。插件创建工作不涉及业务代码贡献上报。
+## 本次改动
 
-## 用户提供的 0.1.0 macOS 实测结果
+- 草稿与发送后的快照卡片共用 Harness 主题变量。背景、底部渐变、窗口标题、缺图占位、通用窗口图标及移除按钮随浅色 / 深色主题动态变化，截图原始像素不改。
+- 保持参考图的 `250:177` 比例、大窗口缩略图、居中的实际应用图标与窗口标题。草稿仅保留移除按钮，发送后的卡片保持静态，没有预览弹窗。
+- 保持 `0.3.2` 的 WebP / XML 展示修复。Host 将 PNG 归一化为 `image/webp` 并保留原 `.png` 文件名时，识别仍接受官方 PNG / JPEG / WebP / GIF 类型，UUID、图片名和有效尺寸继续严格匹配。
+- 沿用 `0.3.1` 原生 helper 的实际前台应用图标读取。图标来自本地应用资源，输出 `32×32` PNG、解码后最大 `8 KiB`，随快照元数据保存；没有图标的旧历史以及读取失败使用通用窗口图标。图标失败不会使截图失败，也不下载图标。
+- 草稿、发送中和历史消息使用静态快照卡片，不再提供图片或可访问文本的预览弹窗；草稿保留单卡删除。
+- 界面中的用户正文隐藏插件生成的 `window_snapshot` 块，包括普通历史、steering、发送中和队列。队列保留官方静态缩略图及图片消息的编辑限制。
+- 模型提交、排队原始内容、会话存储、图片引用及取消信号不变。完整图片、来源和可访问文本仍走普通消息链路，因此停用插件、日志或导出中仍可能看到原始文本块。
+- 新快照携带独立 UUID 和版本标识，元数据与图片名共同配对；新版持久元数据包括可用的应用图标。旧版完整消息也受支持；格式不完整、未知标识或缺图时保持原内容。
 
-证据：2026-10-08 用户提供的 DeepSeek Harness Appshot 与截图，会话名为「快照插件测试会话就绪」。这是旧版 `0.1.0` 的用户实测证据，未由开发代理重新操作验证；不能直接替代 `0.2.0` 草稿卡片的实机验收。
+## 自动检查与界面证据
 
-| 验收项 | 结果与证据 |
-| --- | --- |
-| 插件 Client 加载 | 输入框显示「▣ 快照」按钮，帮助文字为左右 Command 添加前台窗口到草稿 |
-| 真实窗口采集与发送 | 已发送消息包含 `window-snapshot-2026-10-08T07-47-38Z.png` 图片附件与 `<window_snapshot>` 文本块 |
-| 窗口元数据 | 消息包含 Google Chrome、对应窗口标题与采集时间 |
-| 可访问文本 | 消息包含地址栏 URL、浏览器控件和页面文本；模型回复能引用具体页面信息 |
-| 模型接收与文本读取 | 发送后收到模型回复，窗口与页面内容可供模型使用 |
+- `0.3.3` 全量 JavaScript 回归 68/68 通过，0 failed / skipped；Host 与 Client 构建成功，编译后 Client 在官方 ModuleLoader / Cordis / SlotRegistry 中加载及卸载通过。本轮不新增仅重复颜色样式实现的 UI 单元测试。
+- `0.3.3` IAB 合成界面引入已安装官方 `0.2.0-rc.2` 的主题样式，并按官方 DOM 机制设置 `color-scheme` 与 `data-ds-dark-theme`。浅色 → 深色 → 浅色无需重载，三个草稿 / 历史卡片的背景从 `rgb(245,246,247)` 切到 `rgb(53,54,56)` 后恢复；标题、渐变及草稿移除按钮同步变化。缩略图地址切换前后完全一致，卡片仍为 250×177，点击草稿及历史卡片均为 0 个 dialog，用户正文保留，控制台无 error / warn。保存了浅色与深色效果图；仅使用合成窗口图片与本地 Chrome 图标资源，没有捕获真实窗口或调用模型。这不替代真实 Desktop 升级后的主题切换验收。
+- `0.3.2` 历史检查：全量 JavaScript 回归 68/68 通过，0 skipped，含官方发送合同 22 项、Broker / 桥接 / 草稿生命周期 17 项、严格展示解析 20 项、真实组件呈现与卸载 9 项。新增验证 Host 转码后的 WebP / JPEG 在 legacy、v1、v2 与历史恢复中正确配对，同字节的普通图片保留原 gallery，未知 MIME 或错误图片名继续拒绝投影。
+- `0.3.2` 只读回放用户指定的真实持久化消息：图片为 WebP，保留原 `.png` 快照文件名。修复后识别成功，快照独发时展示正文为空，inbox / user node 投影成功；原始消息、图片引用和来源不变。没有修改用户会话、再次采集窗口或调用模型，也没有将用户窗口文字写入测试或分发产物。该核验不替代更新后 Desktop 的实际显示复核。
+- 新增回归在修复前使用官方用户消息组件复现失败：图片类型为 WebP、文件名仍为原快照 `.png` 时，组件显示原始 `window_snapshot` 块。这是针对本次实机问题的红灯证据。
+- `0.3.1` 历史检查为 65/65 通过、0 skipped：官方发送合同 22 项、Broker / 桥接 / 草稿生命周期 17 项、严格展示数据解析 18 项、真实组件呈现与卸载 8 项。它们覆盖图标校验、元数据迁移、v2 历史恢复与旧格式兼容，组件测试中的图标也能进入卡片，但没有覆盖 Host 持久化图片压缩；不能据此声称真实 Desktop 的 XML 隐藏已通过。
+- Node.js 24.16.0 + esbuild 构建 Host 与 ModuleLoader Client。
+- `0.3.0` 历史基线为 59/59 通过。以下记录此前已完成的合同与组件检查，新版全量结果以本节首条最终更新为准。
+- 实际编译的 Client 通过 ModuleLoader 加载，并在真实 Cordis plugin fiber / 官方 SlotRegistry 中启用及卸载：原始 Chat entries 始终只有一个，工具栏与附件注册随卸载释放，原组件恢复，过程不进行真实采集或模型请求。
+- 官方发送合同直接运行固定 npm `0.2.0-rc.2` 的 Lexical、SessionInputShell、ConversationController 和 FileReader 编码；增加同步 optimistic echo 在 `nextPaint` 之前的投影验证，确认展示只含用户正文而真实模型请求仍包含 PNG、来源和 AX 文字。既有引用 chip、queue / steer、失败重试、admission、删除、草稿迁移、指令保护和卸载回归继续保留。
+- 严格解析回归覆盖旧版与新版、同秒多张快照、混合普通图片 / 文件、错误图片名、未知 UUID / 版本、伪造或不完整格式、缓存身份与源对象不变。
+- 呈现回归运行完整的官方 Cordis / SlotRegistry / renderer，并检查原 entry 身份、子插槽权限、store、注入、locale、单个 Chat 入口、声明重载和卸载恢复。React 测试使用客户端渲染，以适应官方 `useSyncExternalStore` 组件。
+- `0.3.1` IAB 合成界面历史检查：草稿与已发送卡片均为 250×177，背景为参考图的 `#292d30`，缩略图与 32 像素本地应用图标均加载成功。实际点击草稿和消息快照后均为 0 个 dialog；单卡删除保留正文和普通附件，普通文件重试仍可用，提交中删除禁用。浅色 / 深色检查通过，页面控制台无 error / warn。页面采用合成窗口图片与安装在本机的 Chrome 图标资源，未捕获真实窗口；这组数据没有经过 Host 持久化压缩，未暴露本次实机失败。
 
-该证据确认图片附件已进入会话，但模型回复可能依据可访问文本生成，尚不能证明模型实际使用了图片进行视觉判断。截图也未展示首次权限弹窗、按键过程或发送前草稿状态，不能据此确认这些交互细节。此处仅记录成功的浏览器窗口样例，不扩展为所有应用均通过。
+官方 fixture 从公开 npm 下载并校验 registry integrity，存放于忽略的 `.fixtures/`，不进入源码或安装包。源码 `0.2.1-alpha.1` 的相关接入点另作静态核对；两版是当前 manifest 限定的支持范围。这些组件装饰依赖版本的实际实现，不能当作官方稳定的快照 API。
 
-仍需实机完成：
+## 原生程序与分发
 
-- macOS：首次授权流程、左右 Command 的触发 / 松开 / 再次触发及去重；更多浏览器与原生应用；Intel / macOS13 运行。
-- Windows：x64 / ARM64 真机启动、左右 Ctrl、浏览器和其它窗口、UI Automation、多屏 DPI、受保护或不响应窗口错误。
-- Desktop：安装 / 升级过程、发送前草稿插入、缩略图预览 / 删除、会话切换 / 多窗口、连续多张快照、重启后的历史图片读取；仅图像可辨内容的模型视觉读取。
-- macOS Developer ID 签名、公证与 Windows 签名未做。
+`0.3.3` 没有修改原生采集源码，沿用 `0.3.1` 本地构建的 macOS / Windows helper。`0.3.1` macOS helper 从含图标支持的源码重新编译为 universal，包含 x86_64 / arm64 架构，当前 arm64 的 8 项无截图自测通过，覆盖左右 Command、按住去重、松开再触发、Unicode 文字上限和 PNG 编码。构建与自测不进行真实窗口捕获。
 
-编译、合同测试和策略自测不能代替产品验收；上述用户实测只覆盖记录中的成功路径。`0.2.0` 不再把快照上下文插入输入框，移除卡片会同时移除图片和对应上下文；发送失败时保留上下文，等待官方恢复图片，重试不重复附带。发送成功的图片仍由 Harness admission 与会话存储负责。
+`0.3.1` Windows x64 / ARM64 使用 .NET SDK 8.0.425，在本地 macOS 从含图标支持的源码分别重新编译与自包含发布，均为 0 warnings / 0 errors，各运行 20 项可移植策略检查并通过。两个发布目录的 PE 架构分别为 `0x8664` 与 `0xaa64`；现有构建脚本重新生成实际 .NET Runtime / Windows Desktop 8.0.31 对应的许可证和第三方声明。`0.3.3` 使用这两个本地产物，没有运行新的远程 CI。
 
-未对齐 Codex 的部分仍包括：已发送消息的快照文字折叠、快照删除撤销、OCR、自动创建 / 选择会话、自动切回 Harness、结构化 AX 树、独立 URL / 选中文字字段、未发送草稿重启恢复。Host PNG 校验是头部 / 尺寸 / 大小检查，完整图片 admission 仍由 Harness 正常发送链路负责。原生采集流程沿用旧版设计；公开安装包由平台 runner 从源码重新构建，构建脚本另包含 PowerShell 兼容与第三方许可证收集。
+Windows `--self-test` 现在共 22 项，其中 5 项新增断言用合成图标检查 PNG 编码、32 像素尺寸、8 KiB 上限、透明度与缺失图标处理。该原生自测依赖 Windows GDI，当前 macOS 无法执行，不能计入已通过的检查。此次未运行 Windows 真实截图程序或安装键盘 hook。
+
+平台 `.tgz` 包含本次编译的 `dist`、manifest、原生 helper、MIT 许可及相关声明，可直接通过 Harness「插件 → 添加插件」填写绝对路径安装；无需解压。源码 `.tar.gz` 包含当前本地修改，需要自行构建；不含 `.git`、依赖、fixture、编译产物或真实窗口数据。
+
+## 用户实测与待验收范围
+
+用户先前提供的 macOS Appshot 确认旧版基础链路可捕获浏览器图片、来源和可访问文字，发送后模型能引用页面具体信息；后来提供的截图确认 `0.2.0` 独立草稿卡和预览弹窗已经加载，同时指出历史消息仍有文本块。这些证据不证明模型使用图片作视觉判断。
+
+本次已确认真实 Desktop 安装的 `0.3.1` 文件与本地产物匹配，用户仍看到了 XML。只读检查用户该条快照的会话记录发现：Host 保存的图片为 `image/webp`，仍保留含同一快照 UUID 的 `.png` 文件名。因此失败来自展示识别的 MIME 限制，并非尚未确认是否加载新版。此记录只描述已读取的失败证据；会话与模型原始消息没有修改。
+
+安装 `0.3.3` 并完全退出再打开 Harness 后，需由用户在真实 Desktop 切换浅色 / 深色主题，确认草稿及发送后的卡片背景、渐变、标题、缺图占位、通用图标和移除按钮同步变化，截图原像素保持。也需继续检查新旧消息的 XML 隐藏、参考图比例、实际应用图标、点击卡片无弹窗、仅快照发送、正文加快照、排队与 steering、发送失败重试、重启后的历史图片与图标、多会话与多窗口。Windows 两架构仍需原生 22 项自测及真机快捷键、UI Automation、多屏 DPI 和异常窗口验收；macOS Intel / macOS 13 与首次权限流程也未在本次覆盖。
+
+未对齐的其它 Codex 行为仍包括移除撤销、OCR、自动选择 / 新建会话、自动切回 Harness、结构化 AX 树、独立 URL / 选中文字字段、未发送草稿重启恢复。macOS Developer ID 公证与 Windows 签名尚未完成。编译、合同测试和合成界面证据不能代替这些产品验收。

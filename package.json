@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-snapshot",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Attach the foreground window and accessible text to a DeepSeek Harness draft",
   "type": "module",
   "license": "MIT",
@@ -68,6 +68,7 @@
   "devDependencies": {
     "esbuild": "0.25.12",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "react-test-renderer": "18.3.1"
   }
 }
