@@ -20,8 +20,8 @@ export function createHandler(broker, native) {
       const body = await readBody(request);
       if (!body || typeof body !== 'object') return json({ error: 'Invalid request' }, 400);
       if (body.op === 'status') return json({ status: broker.status });
-      if (body.op === 'start') { native.start(); return json({ status: broker.status }); }
-      if (body.op === 'restart') { native.restart(); return json({ status: broker.status }); }
+      if (body.op === 'start') { await native.start(); return json({ status: broker.status }); }
+      if (body.op === 'restart') { await native.restart(); return json({ status: broker.status }); }
       if (body.op === 'permissions' || body.op === 'requestPermissions') return json({ permissions: await native.request(body.op), status: broker.status });
       if (!validId(body.clientId) || !validId(body.sessionId)) return json({ error: 'Invalid draft identity' }, 400);
       if (body.op === 'poll') {

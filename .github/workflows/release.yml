@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -77,16 +77,167 @@ jobs:
             "${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-arm64.tgz" \
             "${PACKAGE_NAME}-${PACKAGE_VERSION}-source.tar.gz" > SHA256SUMS.txt
           sha256sum --check SHA256SUMS.txt
+      - name: Prepare safe latest-release policy
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/release-policy.mjs" <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const { GH_REPO: repo, GITHUB_REF_NAME: tag, GITHUB_SHA: commit,
+            PACKAGE_NAME: name, PACKAGE_VERSION: version } = process.env;
+          const endpoint = `repos/${repo}/releases`;
+          const backupPath = 'release-history/releases.json';
+          const assetNames = ['macos.tgz', 'windows-x64.tgz', 'windows-arm64.tgz', 'source.tar.gz']
+            .map(suffix => `${name}-${version}-${suffix}`).concat('SHA256SUMS.txt');
+          const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+          const api = path => JSON.parse(gh('api', path));
+          // Restrict cleanup to ordinary stable semantic versions. Keep other tags intact.
+          const stable = value => {
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(value);
+            return match ? match.slice(1).map(BigInt) : null;
+          };
+          const compare = (left, right) => {
+            for (let i = 0; i < 3; i++) {
+              if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+            }
+            return 0;
+          };
+          const currentVersion = stable(tag);
+          function listReleases() {
+            const result = [];
+            for (let page = 1; ; page++) {
+              const batch = api(`${endpoint}?per_page=100&page=${page}`);
+              result.push(...batch);
+              if (batch.length < 100) return result;
+            }
+          }
+          function assertLatest() {
+            if (api(`${endpoint}/latest`).tag_name !== tag) {
+              throw new Error(`Refusing cleanup: ${tag} is no longer the latest release.`);
+            }
+          }
+          function verifyRelease() {
+            const release = api(`${endpoint}/tags/${encodeURIComponent(tag)}`);
+            if (release.draft || release.prerelease !== !currentVersion || release.tag_name !== tag) {
+              throw new Error('The published release does not match the expected release type and tag.');
+            }
+            if (release.assets.length !== assetNames.length) throw new Error('Expected exactly five release assets.');
+            for (const assetName of assetNames) {
+              const asset = release.assets.find(item => item.name === assetName);
+              const contents = readFileSync(join('artifacts', assetName));
+              const digest = `sha256:${createHash('sha256').update(contents).digest('hex')}`;
+              if (!asset || asset.state !== 'uploaded' || asset.size !== contents.length || asset.digest !== digest) {
+                throw new Error(`Published asset is incomplete or differs from the verified build: ${assetName}`);
+              }
+            }
+            let ref = api(`repos/${repo}/git/ref/tags/${encodeURIComponent(tag)}`).object;
+            while (ref.type === 'tag') ref = api(`repos/${repo}/git/tags/${ref.sha}`).object;
+            if (ref.type !== 'commit' || ref.sha !== commit) throw new Error('Release tag does not point to this workflow commit.');
+            return release;
+          }
+          function assertNoNewer(releases) {
+            if (!currentVersion) return;
+            const newer = releases.find(item => !item.draft && !item.prerelease && stable(item.tag_name)
+              && compare(stable(item.tag_name), currentVersion) > 0);
+            if (newer) throw new Error(`Refusing to replace newer stable release ${newer.tag_name} with ${tag}.`);
+          }
+          const mode = process.argv[2];
+          if (mode === 'publish') {
+            const releases = listReleases();
+            assertNoNewer(releases);
+            if (releases.some(item => item.tag_name === tag)) {
+              // A cleanup retry may reuse this complete, already-published release.
+              verifyRelease();
+              if (currentVersion) gh('release', 'edit', tag, '--latest');
+              console.log(`Verified existing release ${tag}.`);
+            } else {
+              gh('release', 'create', tag, ...assetNames.map(assetName => join('artifacts', assetName)),
+                '--verify-tag', '--title', tag, '--notes-file', 'RELEASE.md',
+                ...(currentVersion ? ['--latest'] : ['--prerelease', '--latest=false']));
+              console.log(`Published ${tag} with all five assets.`);
+            }
+          } else if (mode === 'backup') {
+            const release = verifyRelease();
+            if (!currentVersion) {
+              appendFileSync(process.env.GITHUB_OUTPUT, 'cleanup=false\n');
+              console.log('Prerelease or nonstandard tag: retaining release history.');
+            } else {
+              assertLatest();
+              const releases = listReleases();
+              assertNoNewer(releases);
+              const older = releases.filter(item => !item.draft && !item.prerelease && stable(item.tag_name)
+                && compare(stable(item.tag_name), currentVersion) < 0);
+              mkdirSync('release-history', { recursive: true });
+              writeFileSync(backupPath, JSON.stringify({ repository: repo, retainedTag: tag, commit,
+                recordedAt: new Date().toISOString(), retainedRelease: release, olderReleases: older }, null, 2));
+              writeFileSync('release-history/README.md',
+                `# Release metadata before cleanup\n\nLatest: ${tag}\n\n`
+                + 'The JSON records release notes and asset URLs; it does not contain asset binaries. '
+                + 'Git tags are retained. Platform packages can be rebuilt from those tags.\n\n'
+                + older.map(item => `## ${item.tag_name}\n\n${item.body || ''}\n\n`
+                  + item.assets.map(asset => `- ${asset.name}: ${asset.browser_download_url}`).join('\n')).join('\n\n'));
+              appendFileSync(process.env.GITHUB_OUTPUT, 'cleanup=true\n');
+              console.log(`Backed up metadata for ${older.length} older stable releases before deletion.`);
+            }
+          } else if (mode === 'prune') {
+            const backup = JSON.parse(readFileSync(backupPath, 'utf8'));
+            if (!currentVersion || backup.repository !== repo || backup.retainedTag !== tag || backup.commit !== commit) {
+              throw new Error('Cleanup backup does not match this stable release and workflow.');
+            }
+            verifyRelease();
+            assertLatest();
+            assertNoNewer(listReleases());
+            for (const saved of backup.olderReleases) {
+              assertLatest();
+              const candidate = api(`${endpoint}/${saved.id}`);
+              if (candidate.draft || candidate.prerelease || candidate.tag_name !== saved.tag_name
+                || !stable(candidate.tag_name) || compare(stable(candidate.tag_name), currentVersion) >= 0
+                || candidate.body !== saved.body
+                || JSON.stringify(candidate.assets.map(asset => [asset.id, asset.name, asset.digest]))
+                  !== JSON.stringify(saved.assets.map(asset => [asset.id, asset.name, asset.digest]))) {
+                throw new Error(`Release ${saved.tag_name} changed after backup; refusing to delete it.`);
+              }
+              gh('api', '--method', 'DELETE', `${endpoint}/${candidate.id}`);
+              console.log(`Removed older release ${candidate.tag_name}; its Git tag remains.`);
+            }
+            assertLatest();
+            const remaining = listReleases().filter(item => !item.draft && !item.prerelease && stable(item.tag_name)
+              && compare(stable(item.tag_name), currentVersion) < 0);
+            if (remaining.length) throw new Error('Older stable releases remain; cleanup is incomplete.');
+            console.log(`Only ${tag} remains as the stable downloadable release.`);
+          } else {
+            throw new Error(`Unknown release policy mode: ${mode}`);
+          }
+          NODE
       - name: Publish the verified tag and downloadable assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+        run: node "$RUNNER_TEMP/release-policy.mjs" publish
+      - name: Verify published assets and back up older release metadata
+        id: history
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node "$RUNNER_TEMP/release-policy.mjs" backup
+      - name: Preserve metadata before removing older downloads
+        if: steps.history.outputs.cleanup == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-history-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-history/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Keep only the latest stable downloadable release
+        if: steps.history.outputs.cleanup == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-macos.tgz" \
-            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-x64.tgz" \
-            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-arm64.tgz" \
-            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-source.tar.gz" \
-            artifacts/SHA256SUMS.txt \
-            --verify-tag --title "$GITHUB_REF_NAME" --notes-file RELEASE.md
+          node "$RUNNER_TEMP/release-policy.mjs" prune

@@ -2,6 +2,14 @@
 
 Independent C# implementation for Windows 10/11 x64 and ARM64. The published helper includes the .NET 8 runtime. Building requires the .NET 8 SDK; using the published helper does not require a separate runtime install.
 
+## Runtime location and upgrades
+
+Since plugin 0.4.3, the Node host copies the complete published runtime into a version- and content-specific directory under `%LOCALAPPDATA%\dsh-context-snapshot\helpers\` and starts the cached executable. The running helper no longer occupies the plugin's `node_modules` directory. Keep the full runtime and its third-party notices together; do not copy only `ContextSnapshot.exe`. macOS continues to use its existing app path and permissions.
+
+Follow Harness's current upgrade flow: disable the plugin, wait for the helper to exit, uninstall the old plugin, and add the new platform package. A helper from 0.4.2 or earlier still runs from the old installation directory. On that first migration, an `EPERM` error or damaged installation requires fully exiting Harness, including its tray process, and confirming `ContextSnapshot.exe` has stopped before removing and reinstalling the package. See the root README for the verified Desktop CLI commands. The cache change does not restore missing files or add an automatic installer rollback.
+
+For the local-directory input in Harness, extract the matching platform `.tgz` and select its `package` directory. The CLI can also install the `.tgz` directly. The GitHub repository and source archives do not contain the precompiled runtime, and the plugin is not currently published to npm.
+
 Press left Ctrl and right Ctrl together to capture the foreground window once. Holding the keys does not repeat the capture. Releasing either key resets the gesture. Injected keyboard events are ignored. The hook passes all events through to the original application.
 
 The helper uses `PrintWindow` and DWM frame bounds, crops to the window's intersection with the virtual desktop, and never falls back to a whole-screen capture. Protected, elevated, exclusive-fullscreen, GPU-rendered, minimized, or unresponsive windows can reject capture. A black image is treated as unsupported. Switch to the source window first; exact DSH/helper process names are excluded.
@@ -53,6 +61,6 @@ Requests have `{ "id": "request-id", "method": "capture|permissions|requestPermi
 
 ## Verification boundary
 
-On 2026-10-08, the helper was cross-compiled on macOS using .NET SDK 8.0.425 with zero warnings or errors, both `win-x64` and `win-arm64` were published, and the 45 pure policy checks passed for each build. Neither Windows executable has been run on a Windows machine, and the 22 native checks remain unrun. Pure policy tests and cross-compilation do not establish end-to-end Windows acceptance. Real-machine verification must cover both Ctrl keys, multi-monitor DPI, a browser window and its available control states, DSH draft preview/text switching/attachment/removal, protected-window errors, and UI Automation timeouts.
+The historical local check on 2026-10-08 cross-compiled the helper on macOS using .NET SDK 8.0.425 with zero warnings or errors, published `win-x64` and `win-arm64`, and passed the 45 pure policy checks for each build. That macOS check did not run the Windows executables or the 22 native checks. Current release checks are recorded in the root [VALIDATION.md](../../VALIDATION.md) and GitHub Actions. Build and self-test results do not establish end-to-end Windows acceptance. Real-machine verification must cover both Ctrl keys, multi-monitor DPI, a browser window and its available control states, DSH draft preview/text switching/attachment/removal, protected-window errors, UI Automation timeouts, and upgrades from an older installed version.
 
 API references: [LowLevelKeyboardProc](https://learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc), [PrintWindow](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-printwindow), [DWM window attributes](https://learn.microsoft.com/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute), [UI Automation threading](https://learn.microsoft.com/dotnet/framework/ui-automation/ui-automation-threading-issues), [WM_GETICON](https://learn.microsoft.com/windows/win32/winmsg/wm-geticon), [SendMessageTimeout](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw).
