@@ -14,13 +14,13 @@
 
 ## 安装
 
-`0.4.0` 安装包已在本地构建，本次更新只同步源码，不发布远程 Release。请选择本地输出或自行构建的对应安装包：
+从 [v0.4.0 发布页面](https://github.com/kaelanvoss/dsh-context-snapshot/releases/tag/v0.4.0) 下载适合系统的安装包：
 
-- macOS Apple Silicon / Intel：`dsh-context-snapshot-0.4.0-macos.tgz`
-- Windows x64：`dsh-context-snapshot-0.4.0-windows-x64.tgz`
-- Windows ARM64：`dsh-context-snapshot-0.4.0-windows-arm64.tgz`
+- [macOS Apple Silicon / Intel](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.0/dsh-context-snapshot-0.4.0-macos.tgz)
+- [Windows x64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.0/dsh-context-snapshot-0.4.0-windows-x64.tgz)
+- [Windows ARM64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.0/dsh-context-snapshot-0.4.0-windows-arm64.tgz)
 
-**直接安装请选择平台 `.tgz`，不用解压。** `dsh-context-snapshot-0.4.0-source.tar.gz` 是源码，需要按下方步骤构建，不能作为预编译插件直接添加。对应的 SHA256SUMS 文件用于核对文件完整性。[GitHub Releases](https://github.com/kaelanvoss/dsh-context-snapshot/releases) 暂无 `0.4.0` 安装包；下载当前源码后可按下方步骤自行构建。
+**直接安装请选择平台 `.tgz`，不用解压。** [源码压缩包](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.0/dsh-context-snapshot-0.4.0-source.tar.gz) 及 GitHub 自动生成的 Source code ZIP / tar.gz 需要按下方步骤构建，不能作为预编译插件直接添加。[SHA256SUMS.txt](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.4.0/SHA256SUMS.txt) 用于核对三个安装包及源码压缩包的完整性。平台安装包在 GitHub Actions 中从对应 tag 的源码构建并自检后发布。
 
 公开接口已对官方 npm `0.2.0-rc.2` 与源码 `0.2.1-alpha.1` 核验。manifest 的可选 DSH peer 只声明这两个版本，避免在未经核验的旧版本上直接加载。该插件尚未发布到 npm，不要执行 `add dsh-context-snapshot` 从 registry 下载同名包。
 

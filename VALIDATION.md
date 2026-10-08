@@ -16,6 +16,10 @@
 - 浏览器初次检查复现“点击/拖动大图误关闭”：指针捕获设在遮罩使最终 click 的 target 变成遮罩。修复为图片自身捕获，图上点击/放大后拖动均保持 dialog，焦点留在 dialog，滚动位置确实变化。下载 URL 和 WebP 文件名通过行为回归，JPEG 按实际 MIME 命名的实现已检查；IAB 未返回 download 完成事件，实际文件保存仍需真实 Harness Desktop 验收。
 - 卡片和预览仍需安装新版后在真实 Harness 验收，包括新窗口 AX/UIA 状态完整度、首次权限、Intel/macOS13、Windows多屏/DPI等；没有把合成预览或跨编译当作这些验收。没有运行模型请求，也没有把用户私有窗口内容写入源码、fixture 或分发包。
 
+## 0.4.0 远程构建记录
+
+源码提交 `ba4cc687347f8384bd4fc05c789b17823be2fc85` 的 [GitHub Actions verify](https://github.com/kaelanvoss/dsh-context-snapshot/actions/runs/37785048701) 已成功完成，JavaScript 与 macOS universal / Windows x64 / Windows ARM64 平台构建任务均通过。平台任务成功不代表真实窗口、权限、快捷键或 Desktop 文件保存验收。后续 Release 从 `v0.4.0` tag 重新构建，自检通过后发布平台包、该 tag 的源码压缩包与校验值；发布结果以 Release 页面和对应 Actions 状态为准。
+
 ## 0.3.3 历史验证记录
 
 验证日期：2026-10-08。本次修改仅在本地构建，未提交、推送或更新 GitHub Release、附件和远程信息。`0.3.3` 仅调整 UI 主题适配，真实 Harness Desktop 的主题切换验收仍待用户完成。
