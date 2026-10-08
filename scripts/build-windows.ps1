@@ -57,6 +57,20 @@ foreach ($pack in @($corePack, $desktopPack)) {
 
 $noticePath = Join-Path $publishPath 'third-party'
 New-Item -ItemType Directory -Path $noticePath -Force | Out-Null
+function Get-NoticeSha256([string]$Path) {
+    # Hash directly through .NET so nested Windows PowerShell / pwsh sessions
+    # do not depend on a compatible Microsoft.PowerShell.Utility module path.
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $hash = $algorithm.ComputeHash($stream)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $algorithm.Dispose()
+    }
+}
 function Copy-RequiredNotice([string]$Source, [string]$Name) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
         throw "Required third-party notice was not found: $Name"
@@ -75,7 +89,7 @@ $bundledManifest = Get-Content -LiteralPath (Join-Path $bundledNotices 'manifest
 if ($bundledManifest.windowsDesktopVersion -eq $desktopVersion -and
     $bundledManifest.sources.wpf -eq $wpfSource) {
     $bundledWpf = Join-Path $bundledNotices 'WPF-THIRD-PARTY-NOTICES.txt'
-    $bundledHash = (Get-FileHash -LiteralPath $bundledWpf -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bundledHash = Get-NoticeSha256 $bundledWpf
     if ($bundledHash -ne $bundledManifest.sha256.'WPF-THIRD-PARTY-NOTICES.txt') {
         throw 'The bundled version-matched WPF notice failed its integrity check.'
     }
@@ -93,7 +107,7 @@ if ($wpfContent.Length -lt 100 -or -not $wpfContent.StartsWith('.NET Core uses t
 
 $noticeHashes = [ordered]@{}
 foreach ($name in @('DOTNET-LICENSE.txt', 'DOTNET-THIRD-PARTY-NOTICES.txt', 'WINDOWSDESKTOP-LICENSE.txt', 'WPF-THIRD-PARTY-NOTICES.txt')) {
-    $noticeHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $noticePath $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $noticeHashes[$name] = Get-NoticeSha256 (Join-Path $noticePath $name)
 }
 $noticeManifest = [ordered]@{
     schemaVersion = 1
