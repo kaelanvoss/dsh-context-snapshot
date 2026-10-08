@@ -4,6 +4,9 @@ import { createPortal } from 'react-dom';
 const foreground = 'var(--dsw-alias-label-primary, CanvasText)';
 const surface = 'var(--dsw-alias-bg-module-platform, Canvas)';
 const control = { display: 'grid', placeItems: 'center', minWidth: 36, height: 36, padding: '0 12px', border: 0, borderRadius: 24, background: surface, color: foreground, cursor: 'pointer', font: 'inherit', fontSize: 13 };
+// Harness publishes this on html so body portals clear native window controls
+// and follow fullscreen changes; the browser-only layout keeps its usual inset.
+const toolbarPadding = 'max(14px, var(--dsh-frame-overlay-top, 14px)) 16px 14px';
 const EMPTY_TEXT = '此窗口未提供可访问文本；请查看图片。';
 
 /** Saved accessibility data only: opening a preview never captures the window again. */
@@ -104,8 +107,8 @@ export function SnapshotPreview({ items, initialIndex = 0, initialSrc, onClose }
       else if (!event.shiftKey && (position < 0 || position === buttons.length - 1)) { event.preventDefault(); buttons[0]?.focus(); }
     }
   };
-  const dialog = <div ref={root} role="dialog" tabIndex={-1} aria-modal="true" aria-label={`快照预览：${capture.title || '窗口快照'}`} data-snapshot-preview onKeyDown={onKeyDown} onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ position: 'fixed', inset: 0, zIndex: 2147483000, display: 'flex', flexDirection: 'column', background: 'rgb(0 0 0 / .86)', color: foreground, fontFamily: 'inherit' }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 16px', flexShrink: 0 }}>
+  const dialog = <div ref={root} role="dialog" tabIndex={-1} aria-modal="true" aria-label={`快照预览：${capture.title || '窗口快照'}`} data-snapshot-preview onKeyDown={onKeyDown} onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ position: 'fixed', inset: 0, zIndex: 2147483000, display: 'flex', flexDirection: 'column', background: 'rgb(0 0 0 / .86)', color: foreground, fontFamily: 'inherit', WebkitAppRegion: 'no-drag' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: toolbarPadding, flexShrink: 0 }}>
       <span style={{ color: '#fff', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13, opacity: .8 }}>{capture.title || '窗口快照'} · {capture.appName || '未知应用'}</span>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
         {text && <button type="button" aria-pressed={textView} onClick={() => setTextView(current => !current)} style={{ ...control, ...(textView ? { background: 'var(--dsw-alias-brand-primary-new-colorprimary-new-color, #3977ee)', color: '#fff' } : {}) }}>查看文本</button>}
