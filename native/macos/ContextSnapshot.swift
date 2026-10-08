@@ -300,9 +300,9 @@ private final class SnapshotHelper: @unchecked Sendable {
                     self?.writer.send(["type": "error", "error": ["code": "INVALID_REQUEST", "message": "Expected one JSON request per line"]])
                     continue
                 }
-                DispatchQueue.main.async { self?.handleLine(line) }
+                DispatchQueue.main.async { [weak self] in self?.handleLine(line) }
             }
-            DispatchQueue.main.async { self?.shutdown() }
+            DispatchQueue.main.async { [weak self] in self?.shutdown() }
         }
     }
 
