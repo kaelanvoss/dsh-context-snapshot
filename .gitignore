@@ -1,0 +1,13 @@
+node_modules/
+dist/
+artifacts/
+native/macos/build/
+native/windows/bin/
+native/windows/obj/
+native/windows/tests/bin/
+native/windows/tests/obj/
+native/windows/publish/
+*.tgz
+*.tar.gz
+.DS_Store
+.fixtures/

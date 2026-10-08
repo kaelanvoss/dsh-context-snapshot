@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "8.0.31",
+  "windowsDesktopVersion": "8.0.31",
+  "sources": {
+    "runtime": "https://www.nuget.org/packages/Microsoft.NETCore.App.Runtime.win-x64/8.0.31",
+    "windowsDesktop": "https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64/8.0.31",
+    "wpf": "https://raw.githubusercontent.com/dotnet/wpf/v8.0.31/THIRD-PARTY-NOTICES.TXT"
+  },
+  "sha256": {
+    "DOTNET-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310",
+    "DOTNET-THIRD-PARTY-NOTICES.txt": "97c1a7b3da6a4c6ad516448719f45114b41a4d4c5aa300a944476e2e4f5da438",
+    "WINDOWSDESKTOP-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310",
+    "WPF-THIRD-PARTY-NOTICES.txt": "d23dba2fee20c6b59d8f7088ee9ed372459c952a319b7ca90f3eec370cc76eb9"
+  }
+}

@@ -1,0 +1,92 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      name: ${{ steps.package.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate the release tag and manifest
+        id: package
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const { name, version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+            throw new Error('Invalid package name or version for release filenames.');
+          }
+          if (process.env.GITHUB_REF_NAME !== `v${version}`) {
+            throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} does not match package version ${version}.`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nname=${name}\n`);
+          NODE
+          test -s RELEASE.md
+
+  packages:
+    needs: validate
+    uses: ./.github/workflows/verify.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: [validate, packages]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      PACKAGE_NAME: ${{ needs.validate.outputs.name }}
+      PACKAGE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble source archive and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in macos windows-x64 windows-arm64; do
+            test -s "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-${platform}.tgz"
+          done
+          git archive --format=tar --prefix="${PACKAGE_NAME}-${PACKAGE_VERSION}/" HEAD |
+            gzip -n > "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-source.tar.gz"
+          cd artifacts
+          sha256sum \
+            "${PACKAGE_NAME}-${PACKAGE_VERSION}-macos.tgz" \
+            "${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-x64.tgz" \
+            "${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-arm64.tgz" \
+            "${PACKAGE_NAME}-${PACKAGE_VERSION}-source.tar.gz" > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+      - name: Publish the verified tag and downloadable assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-macos.tgz" \
+            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-x64.tgz" \
+            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-windows-arm64.tgz" \
+            "artifacts/${PACKAGE_NAME}-${PACKAGE_VERSION}-source.tar.gz" \
+            artifacts/SHA256SUMS.txt \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file RELEASE.md
