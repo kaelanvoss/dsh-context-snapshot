@@ -17,6 +17,7 @@ export class NativeBridge {
   disposed = false;
   starting = null;
   generation = 0;
+  readiness = null;
   constructor(broker, options = {}) { this.broker = broker; this.options = options; }
   start() {
     if (this.child || this.disposed) return Promise.resolve();
@@ -47,6 +48,10 @@ export class NativeBridge {
   spawnHelper(command) {
     const child = (this.options.spawn ?? spawn)(command, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false });
     this.child = child;
+    let readyResolve, readyReject;
+    const readyPromise = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+    readyPromise.catch(() => {});
+    this.readiness = { promise: readyPromise, resolve: readyResolve, reject: readyReject };
     this.broker.status = { ...this.broker.status, running: true, ready: false, error: '' };
     const active = () => !this.disposed && this.child === child;
     const decoder = new LineDecoder(frame => { if (active()) this.frame(frame); }, e => { if (active()) this.broker.fail('', e.message); });
@@ -56,6 +61,7 @@ export class NativeBridge {
     const finish = message => {
       if (this.child !== child) return;
       this.child = null; this.broker.status.running = false; this.broker.status.ready = false;
+      this.readiness?.reject(new Error(message || '原生快照程序已退出。'));
       if (message) this.broker.fail('', message);
       for (const task of this.pending.values()) task.reject(new Error(message || '原生快照程序已退出。'));
       this.pending.clear();
@@ -66,39 +72,73 @@ export class NativeBridge {
   }
   frame(frame) {
     if (!frame || typeof frame !== 'object') return;
-    if (frame.type === 'ready' && frame.protocol === 1) { this.broker.status.ready = true; return; }
-    if (frame.type === 'trigger' && typeof frame.captureId === 'string') this.broker.trigger(frame.captureId);
-    if (frame.type === 'capture' && typeof frame.captureId === 'string') this.broker.capture(frame.captureId, frame.capture);
+    if (frame.type === 'ready' && frame.protocol === 1) {
+      const child = this.child, readiness = this.readiness;
+      if (frame.ready === false) {
+        const error = new Error('快捷键监听尚未就绪，请检查权限并重启采集。');
+        this.broker.status.ready = false; this.broker.status.error = error.message;
+        readiness?.reject(error); return;
+      }
+      if (!this.options.onReady) { this.broker.status.ready = true; readiness?.resolve(); return; }
+      Promise.resolve().then(() => {
+        if (this.child !== child || this.disposed) throw new Error('原生采集程序初始化已取消。');
+        return this.options.onReady(frame);
+      }).then(() => {
+        if (this.child === child && !this.disposed) { this.broker.status.ready = true; readiness?.resolve(); }
+      }, error => {
+        if (this.child === child && !this.disposed) { this.broker.status.ready = false; this.broker.status.error = error.message; readiness?.reject(error); }
+      });
+      return;
+    }
+    if (frame.type === 'trigger' && typeof frame.captureId === 'string' && (!this.options.onReady || this.broker.status.ready)) this.broker.trigger(frame.captureId);
+    if (frame.type === 'capture' && typeof frame.captureId === 'string' && (!this.options.onReady || this.broker.status.ready)) this.broker.capture(frame.captureId, frame.capture);
     if (frame.type === 'error') this.broker.fail(frame.captureId ?? '', frame.error?.message ?? '截图失败');
     if (frame.type === 'result') {
       if (frame.ok && frame.permissions) this.broker.status.permissions = frame.permissions;
       const task = this.pending.get(frame.id);
-      if (task) { this.pending.delete(frame.id); frame.ok ? task.resolve(frame.permissions ?? {}) : task.reject(new Error(frame.error?.message ?? '原生请求失败')); }
+      if (task) { this.pending.delete(frame.id); frame.ok ? task.resolve(task.method === 'permissions' || task.method === 'requestPermissions' ? frame.permissions ?? {} : frame) : task.reject(new Error(frame.error?.message ?? '原生请求失败')); }
     }
   }
-  async request(method) {
+  async waitReady() {
+    await this.start();
+    if (!this.child || !this.readiness) throw new Error(this.broker.status.error || '原生程序不可用');
+    let timer;
+    try { await Promise.race([this.readiness.promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('快捷键配置尚未就绪，请重启采集后重试。')), 8000); })]); }
+    finally { clearTimeout(timer); }
+  }
+  async request(method, parameters = {}) {
     const generation = this.generation;
     await this.start();
     if (this.disposed || generation !== this.generation) throw new Error('原生采集程序启动已取消，请重新检查状态。');
     if (!this.child?.stdin.writable) throw new Error(this.broker.status.error || '原生程序不可用');
     return new Promise((resolve, reject) => {
       const id = randomUUID();
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('原生权限检查超时，请检查系统设置。')); }, 8000);
-      this.pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: e => { clearTimeout(timer); reject(e); } });
-      try { this.child.stdin.write(JSON.stringify({ id, method }) + '\n'); }
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('原生请求超时，请检查权限或重启采集。')); }, 8000);
+      this.pending.set(id, { method, resolve: value => { clearTimeout(timer); resolve(value); }, reject: e => { clearTimeout(timer); reject(e); } });
+      try { this.child.stdin.write(JSON.stringify({ ...parameters, id, method }) + '\n'); }
       catch (e) { this.pending.get(id)?.reject(e); this.pending.delete(id); }
     });
   }
-  restart() {
+  stop(message = '') {
     this.generation++;
+    const error = new Error(message || '原生快照程序正在重启。');
+    this.readiness?.reject(error);
     this.starting = null;
     const child = this.child;
-    if (child) { this.child = null; child.kill(); for (const task of this.pending.values()) task.reject(new Error('原生快照程序正在重启。')); this.pending.clear(); }
+    this.child = null;
+    for (const task of this.pending.values()) task.reject(error);
+    this.pending.clear();
+    if (child) child.kill();
+    Object.assign(this.broker.status, { running: false, ready: false, recording: false, error: message });
+  }
+  restart() {
+    this.stop();
     return this.start();
   }
   dispose() {
     this.disposed = true;
     this.generation++;
+    this.readiness?.reject(new Error('快照插件已停用。'));
     if (this.child) { const child = this.child; try { child.stdin.end(JSON.stringify({ id: randomUUID(), method: 'shutdown' }) + '\n'); } catch { child.kill(); } const timer = setTimeout(() => child.kill(), 1000); timer.unref(); child.once('close', () => clearTimeout(timer)); }
   }
 }

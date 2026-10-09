@@ -11,16 +11,105 @@ private let maximumAppIconPNGBytes = 8 * 1024
 private let maximumTextCharacters = 16_000
 private let helperBundleID = "io.dsh.context-snapshot.helper"
 
-/// Device-specific modifier flags distinguish a chord from two presses of one key.
-struct DoubleCommandState {
-    private(set) var latched = false
+/// Physical key codes are independent of the active keyboard layout. Locked
+/// modifiers and media keys are intentionally absent: they are not held chords.
+private let physicalCodes: [CGKeyCode: String] = [
+    0: "KeyA", 1: "KeyS", 2: "KeyD", 3: "KeyF", 4: "KeyH", 5: "KeyG",
+    6: "KeyZ", 7: "KeyX", 8: "KeyC", 9: "KeyV", 10: "IntlBackslash", 11: "KeyB",
+    12: "KeyQ", 13: "KeyW", 14: "KeyE", 15: "KeyR", 16: "KeyY", 17: "KeyT",
+    18: "Digit1", 19: "Digit2", 20: "Digit3", 21: "Digit4", 22: "Digit6", 23: "Digit5",
+    24: "Equal", 25: "Digit9", 26: "Digit7", 27: "Minus", 28: "Digit8", 29: "Digit0",
+    30: "BracketRight", 31: "KeyO", 32: "KeyU", 33: "BracketLeft", 34: "KeyI", 35: "KeyP",
+    36: "Enter", 37: "KeyL", 38: "KeyJ", 39: "Quote", 40: "KeyK", 41: "Semicolon",
+    42: "Backslash", 43: "Comma", 44: "Slash", 45: "KeyN", 46: "KeyM", 47: "Period",
+    48: "Tab", 49: "Space", 50: "Backquote", 51: "Backspace", 53: "Escape",
+    54: "MetaRight", 55: "MetaLeft", 56: "ShiftLeft", 58: "AltLeft", 59: "ControlLeft",
+    60: "ShiftRight", 61: "AltRight", 62: "ControlRight", 64: "F17", 65: "NumpadDecimal",
+    67: "NumpadMultiply", 69: "NumpadAdd", 75: "NumpadDivide", 76: "NumpadEnter",
+    78: "NumpadSubtract", 79: "F18", 80: "F19", 81: "NumpadEqual", 82: "Numpad0",
+    83: "Numpad1", 84: "Numpad2", 85: "Numpad3", 86: "Numpad4", 87: "Numpad5",
+    88: "Numpad6", 89: "Numpad7", 90: "F20", 91: "Numpad8", 92: "Numpad9",
+    93: "IntlYen", 94: "IntlRo", 95: "NumpadComma", 96: "F5", 97: "F6", 98: "F7",
+    99: "F3", 100: "F8", 101: "F9", 103: "F11", 105: "F13", 106: "F16", 107: "F14",
+    109: "F10", 111: "F12", 113: "F15", 114: "Insert", 115: "Home", 116: "PageUp",
+    117: "Delete", 118: "F4", 119: "End", 120: "F2", 121: "PageDown", 122: "F1",
+    123: "ArrowLeft", 124: "ArrowRight", 125: "ArrowDown", 126: "ArrowUp"
+]
 
-    mutating func update(left: Bool, right: Bool) -> Bool {
-        if !left || !right {
-            latched = false
-            return false
+private let modifierMasks: [String: UInt64] = [
+    "ControlLeft": 0x01, "ControlRight": 0x2000,
+    "ShiftLeft": 0x02, "ShiftRight": 0x04,
+    "MetaLeft": 0x08, "MetaRight": 0x10,
+    "AltLeft": 0x20, "AltRight": 0x40
+]
+private let modifierCodes = Set(modifierMasks.keys)
+private let supportedCodes = Set(physicalCodes.values)
+
+private struct ShortcutConfiguration {
+    let codes: [String]
+    static let defaultShortcut = ShortcutConfiguration(codes: ["MetaLeft", "MetaRight"])
+    var object: [String: Any] { ["version": 1, "codes": codes] }
+
+    static func parse(_ value: Any?) -> ShortcutConfiguration? {
+        guard let object = value as? [String: Any],
+              let version = object["version"] as? NSNumber,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.doubleValue == 1,
+              let codes = object["codes"] as? [String], codes.count >= 2,
+              Set(codes).count == codes.count, codes.allSatisfy({ supportedCodes.contains($0) }) else { return nil }
+        return ShortcutConfiguration(codes: codes)
+    }
+}
+
+/// Confined to the main run loop. Exact physical chords fire once on a fresh
+/// bound-key press; releasing an unrelated extra key never causes a capture.
+private struct ShortcutState {
+    private(set) var shortcut = ShortcutConfiguration.defaultShortcut
+    private(set) var pressed = Set<String>()
+    private(set) var latched = false
+    private(set) var recording = false
+    private var blockedUntilRelease = Set<String>()
+
+    mutating func reset(blocking held: Set<String> = []) {
+        pressed.removeAll()
+        latched = false
+        blockedUntilRelease = held
+    }
+
+    mutating func configure(_ value: ShortcutConfiguration, blocking held: Set<String> = []) {
+        shortcut = value
+        reset(blocking: held)
+    }
+
+    mutating func setRecording(_ value: Bool, blocking held: Set<String> = []) {
+        recording = value
+        reset(blocking: held)
+    }
+
+    mutating func update(code: String?, down: Bool, modifiers: Set<String>, repeated: Bool = false,
+                         physicallyHeld: Set<String>? = nil) -> Bool {
+        guard !recording else { return false }
+        let previous = pressed
+        if let physicallyHeld {
+            // Command shortcuts may omit an ordinary keyUp. On modifier events,
+            // remove stale ordinary keys using the current physical key state.
+            pressed = pressed.filter { modifierCodes.contains($0) || physicallyHeld.contains($0) }
+            blockedUntilRelease = blockedUntilRelease.filter {
+                modifierCodes.contains($0) || physicallyHeld.contains($0)
+            }
         }
-        guard !latched else { return false }
+        pressed.subtract(modifierCodes)
+        pressed.formUnion(modifiers)
+        blockedUntilRelease = blockedUntilRelease.filter {
+            !modifierCodes.contains($0) || modifiers.contains($0)
+        }
+        if let code, !modifierCodes.contains(code) {
+            if down { pressed.insert(code) }
+            else { pressed.remove(code); blockedUntilRelease.remove(code) }
+        }
+        let required = Set(shortcut.codes)
+        if !previous.subtracting(pressed).isDisjoint(with: required) { latched = false }
+        guard blockedUntilRelease.isEmpty, !repeated, !latched, pressed == required,
+              !pressed.subtracting(previous).isDisjoint(with: required) else { return false }
         latched = true
         return true
     }
@@ -469,14 +558,18 @@ private func screenshot(_ target: WindowTarget) async throws -> CGImage {
 /// background access is the independently locked protocol writer.
 private final class SnapshotHelper: @unchecked Sendable {
     private let writer = JSONWriter()
-    private var commandState = DoubleCommandState()
+    private var shortcutState = ShortcutState()
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var capturing = false
 
     func start() {
+        // The host restores preferences and recorder leases before it explicitly
+        // resumes capture. Restarting during key recording cannot capture here.
+        shortcutState.setRecording(true, blocking: currentlyHeldCodes().intersection(supportedCodes))
         installTap()
-        writer.send(["type": "ready", "protocol": 1, "platform": "darwin"])
+        writer.send(["type": "ready", "protocol": 1, "platform": "darwin", "ready": tap != nil,
+                     "shortcut": shortcutState.shortcut.object, "supportedCodes": supportedCodes.sorted(), "recording": true])
         DispatchQueue.global(qos: .utility).async { [weak self] in
             while let line = readLine() {
                 guard line.utf8.count <= 65_536 else {
@@ -492,31 +585,45 @@ private final class SnapshotHelper: @unchecked Sendable {
     private func installTap() {
         guard tap == nil else { return }
         let userData = Unmanaged.passUnretained(self).toOpaque()
+        let interest = CGEventMask((1 << CGEventType.flagsChanged.rawValue)
+            | (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue))
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-            eventsOfInterest: CGEventMask(1 << CGEventType.flagsChanged.rawValue), callback: { _, type, event, userData in
+            eventsOfInterest: interest, callback: { _, type, event, userData in
                 guard let userData else { return Unmanaged.passUnretained(event) }
                 let helper = Unmanaged<SnapshotHelper>.fromOpaque(userData).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    helper.commandState = DoubleCommandState()
+                    helper.shortcutState.reset(blocking: helper.currentlyHeldCodes().intersection(supportedCodes))
                     if let tap = helper.tap { CGEvent.tapEnable(tap: tap, enable: true) }
-                } else if type == .flagsChanged {
-                    let key = event.getIntegerValueField(.keyboardEventKeycode)
-                    if key == 54 || key == 55 {
-                        let flags = event.flags.rawValue
-                        if helper.commandState.update(left: flags & 0x08 != 0, right: flags & 0x10 != 0) {
-                            helper.capture(id: UUID().uuidString)
-                        }
+                } else if type == .flagsChanged || type == .keyDown || type == .keyUp {
+                    let flags = event.flags.rawValue
+                    let modifiers = Set(modifierMasks.compactMap { code, mask in flags & mask != 0 ? code : nil })
+                    let key = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                    // An unmapped ordinary key still prevents an exact chord
+                    // while held, but can never be stored as a shortcut.
+                    let code = type == .flagsChanged ? nil : physicalCodes[key] ?? "unmapped-\(key)"
+                    let held = type == .flagsChanged ? helper.currentlyHeldCodes() : nil
+                    if helper.shortcutState.update(code: code, down: type == .keyDown, modifiers: modifiers,
+                        repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0, physicallyHeld: held) {
+                        helper.capture(id: UUID().uuidString)
                     }
                 }
                 return Unmanaged.passUnretained(event)
             }, userInfo: userData)
         guard let tap else {
-            diagnose("Global modifier listener unavailable; grant Input Monitoring or Accessibility in System Settings, then requestPermissions or restart the helper")
+            diagnose("Global shortcut listener unavailable; grant Input Monitoring or Accessibility in System Settings, then requestPermissions or restart the helper")
             return
         }
         tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         if let tapSource { CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes) }
         CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func currentlyHeldCodes() -> Set<String> {
+        Set((0...127).compactMap { value -> String? in
+            let key = CGKeyCode(value)
+            return CGEventSource.keyState(.combinedSessionState, key: key)
+                ? physicalCodes[key] ?? "unmapped-\(key)" : nil
+        })
     }
 
     private func handleLine(_ line: String) {
@@ -533,7 +640,26 @@ private final class SnapshotHelper: @unchecked Sendable {
         switch method {
         case "capture": capture(id: id)
         case "permissions", "status":
-            writer.send(["type": "result", "id": id, "ok": true, "permissions": permissionState()])
+            writer.send(["type": "result", "id": id, "ok": true, "permissions": permissionState(),
+                         "ready": tap != nil, "shortcut": shortcutState.shortcut.object,
+                         "supportedCodes": supportedCodes.sorted(), "recording": shortcutState.recording])
+        case "setShortcut":
+            guard let shortcut = ShortcutConfiguration.parse(request["shortcut"]) else {
+                writer.send(["type": "result", "id": id, "ok": false,
+                    "error": ["code": "INVALID_SHORTCUT", "message": "Shortcut needs version 1 and at least two distinct supported physical keys"]])
+                return
+            }
+            shortcutState.configure(shortcut, blocking: currentlyHeldCodes().intersection(supportedCodes))
+            writer.send(["type": "result", "id": id, "ok": true, "shortcut": shortcut.object])
+        case "setRecording":
+            guard let value = request["active"] as? NSNumber,
+                  CFGetTypeID(value) == CFBooleanGetTypeID() else {
+                writer.send(["type": "result", "id": id, "ok": false,
+                    "error": ["code": "INVALID_REQUEST", "message": "Recording active must be a boolean"]])
+                return
+            }
+            shortcutState.setRecording(value.boolValue, blocking: currentlyHeldCodes().intersection(supportedCodes))
+            writer.send(["type": "result", "id": id, "ok": true, "recording": shortcutState.recording])
         case "requestPermissions":
             // Only this explicit request is permitted to present macOS privacy prompts.
             if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
@@ -543,7 +669,9 @@ private final class SnapshotHelper: @unchecked Sendable {
             }
             if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
             installTap()
-            writer.send(["type": "result", "id": id, "ok": true, "permissions": permissionState()])
+            writer.send(["type": "result", "id": id, "ok": true, "permissions": permissionState(),
+                         "ready": tap != nil, "shortcut": shortcutState.shortcut.object,
+                         "supportedCodes": supportedCodes.sorted(), "recording": shortcutState.recording])
         case "shutdown":
             writer.send(["type": "result", "id": id, "ok": true])
             shutdown()
@@ -602,17 +730,83 @@ private final class SnapshotHelper: @unchecked Sendable {
 
 @MainActor
 private func runSelfTest() throws {
-    var chord = DoubleCommandState()
-    let events: [(Bool, Bool, Bool)] = [
-        (false, false, false), (true, false, false), (true, true, true),
-        (true, true, false), (true, false, false), (true, true, true),
-        (false, true, false), (false, false, false), (false, true, false), (true, true, true)
-    ]
-    for event in events {
-        guard chord.update(left: event.0, right: event.1) == event.2 else {
-            throw CaptureFailure(code: "SELF_TEST_FAILED", message: "Double Command chord state failed")
-        }
+    func verify(_ condition: Bool, _ message: String) throws {
+        if !condition { throw CaptureFailure(code: "SELF_TEST_FAILED", message: message) }
     }
+    var chord = ShortcutState()
+    let events: [(Set<String>, Bool)] = [
+        ([], false), (["MetaLeft"], false), (["MetaLeft", "MetaRight"], true),
+        (["MetaLeft", "MetaRight"], false), (["MetaLeft"], false), (["MetaLeft", "MetaRight"], true),
+        (["MetaRight"], false), ([], false), (["MetaRight"], false), (["MetaLeft", "MetaRight"], true)
+    ]
+    for (modifiers, expected) in events {
+        try verify(chord.update(code: nil, down: false, modifiers: modifiers) == expected,
+                   "Default Double Command chord failed")
+    }
+    try verify(ShortcutConfiguration.parse(["version": 1, "codes": ["MetaLeft", "KeyS"]]) != nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["F8", "F9", "F10", "F11"]]) != nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["KeyA"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["KeyA", "KeyA"]]) == nil
+        && ShortcutConfiguration.parse(["version": 2, "codes": ["MetaLeft", "KeyS"]]) == nil
+        && ShortcutConfiguration.parse(["version": true, "codes": ["MetaLeft", "KeyS"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["CapsLock", "KeyS"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["Unknown", "KeyS"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": [1, 2]]) == nil
+        && supportedCodes.count == physicalCodes.count && modifierCodes.isSubset(of: supportedCodes),
+        "Shortcut validation or physical code mapping failed")
+
+    chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "ShiftRight", "KeyS"]))
+    try verify(!chord.update(code: "KeyS", down: true, modifiers: []), "Early key fired")
+    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Incomplete chord fired")
+    try verify(chord.update(code: nil, down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+               "Mixed chord or reverse press order failed")
+    try verify(!chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft", "ShiftRight"], repeated: true),
+               "Auto repeat fired")
+    try verify(!chord.update(code: "KeyA", down: true, modifiers: ["MetaLeft", "ShiftRight"]),
+               "Extra ordinary key fired")
+    try verify(!chord.update(code: "KeyA", down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+               "Unrelated key release rearmed the chord")
+    try verify(!chord.update(code: "KeyS", down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+               "Bound key release fired")
+    try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft", "ShiftRight"]),
+               "Bound key release did not rearm")
+
+    chord.configure(ShortcutConfiguration(codes: ["F8", "F9"]))
+    try verify(!chord.update(code: "F8", down: true, modifiers: ["ShiftLeft"]), "Incomplete pair fired")
+    try verify(!chord.update(code: "F9", down: true, modifiers: ["ShiftLeft"]), "Extra modifier was accepted")
+    try verify(!chord.update(code: nil, down: false, modifiers: []), "Extra modifier release fired")
+    try verify(!chord.update(code: "F8", down: false, modifiers: []), "Key release fired")
+    try verify(chord.update(code: "F8", down: true, modifiers: []), "Ordinary pair did not fire")
+    chord.setRecording(true)
+    try verify(!chord.update(code: "F8", down: true, modifiers: []), "Recording did not pause")
+    chord.setRecording(false, blocking: ["F8", "F9"])
+    try verify(!chord.update(code: "F8", down: true, modifiers: [], repeated: true), "Recording resume repeated")
+    try verify(!chord.update(code: "F9", down: true, modifiers: []), "Held recording key fired")
+    try verify(!chord.update(code: "F8", down: false, modifiers: []), "Blocked release fired")
+    try verify(!chord.update(code: "F9", down: false, modifiers: []), "Blocked pair release fired")
+    try verify(!chord.update(code: "F9", down: true, modifiers: []), "Ordinary pair fired early")
+    try verify(chord.update(code: "F8", down: true, modifiers: []), "Recording resume failed to rearm")
+    chord.configure(ShortcutConfiguration(codes: ["F8", "F9", "F10", "F11"]))
+    for code in ["F8", "F9", "F10"] {
+        try verify(!chord.update(code: code, down: true, modifiers: []), "Four-key chord fired early")
+    }
+    try verify(chord.update(code: "F11", down: true, modifiers: []), "Four-key chord failed")
+
+    chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "KeyS"]))
+    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Modifier fired early")
+    try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft"]), "Command-letter chord failed")
+    try verify(!chord.update(code: nil, down: false, modifiers: [], physicallyHeld: []), "Missing keyUp cleanup fired")
+    try verify(chord.pressed.isEmpty && !chord.latched, "Missing Command keyUp was retained")
+    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Cleaned chord fired early")
+    try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft"]), "Missing keyUp cleanup did not rearm")
+    chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "MetaRight"]))
+    try verify(!chord.update(code: "unmapped-63", down: true, modifiers: ["MetaLeft"]), "Unmapped key fired")
+    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft", "MetaRight"],
+                            physicallyHeld: ["unmapped-63"]), "Unmapped held key was ignored")
+    try verify(!chord.update(code: "unmapped-63", down: false, modifiers: ["MetaLeft", "MetaRight"]),
+               "Unmapped extra key release fired")
+    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Unmapped cleanup release fired")
+    try verify(chord.update(code: nil, down: false, modifiers: ["MetaLeft", "MetaRight"]), "Unmapped cleanup failed")
     guard boundedText([String(repeating: "界", count: 20_000)]).count == maximumTextCharacters else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "Text limit failed")
     }
@@ -706,7 +900,7 @@ private func runSelfTest() throws {
           appIconPNGBase64(NSImage(size: .zero)) == nil else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "App icon encoding, bounds or fallback failed")
     }
-    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "unicode-text-limit", "utf16-emoji-limit", "utf16-grapheme-and-newline-boundaries", "ax-tree-hierarchy-and-repeated-controls", "ax-provider-states", "ax-selection-range", "ax-safe-scalars-and-string-bounds", "ax-password-hidden-and-failed-safety-exclusion", "png-encoding", "app-icon-png-bounds", "app-icon-transparent-padding", "app-icon-optional-fallback"]])
+    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "shortcut-validation-and-physical-codes", "mixed-chord-reverse-press-order", "exact-ordinary-and-modifier-chords", "recording-pause-and-held-key-blocking", "arbitrary-multi-key-chord", "command-missing-keyup-cleanup", "unmapped-extra-key-blocking", "unicode-text-limit", "utf16-emoji-limit", "utf16-grapheme-and-newline-boundaries", "ax-tree-hierarchy-and-repeated-controls", "ax-provider-states", "ax-selection-range", "ax-safe-scalars-and-string-bounds", "ax-password-hidden-and-failed-safety-exclusion", "png-encoding", "app-icon-png-bounds", "app-icon-transparent-padding", "app-icon-optional-fallback"]])
 }
 
 if CommandLine.arguments.contains("--self-test") {

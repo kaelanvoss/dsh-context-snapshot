@@ -5,6 +5,9 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { NativeBridge } from '../src/native.mjs';
 import { SnapshotBroker } from '../src/broker.mjs';
+import { ShortcutSettings } from '../src/shortcut-settings.mjs';
+import { defaultShortcut, normalizeShortcut, supportedShortcutCodes } from '../src/shortcuts.mjs';
+import { createHandler } from '../src/index.mjs';
 
 function childFixture() {
   const child = new EventEmitter();
@@ -158,4 +161,81 @@ test('buffered frames from replaced or disposed helpers cannot affect the active
   assert.deepEqual(broker.status, disposedStatus);
   assert.equal(broker.items.size, 0);
   fresh.emit('close');
+});
+
+function configuredFixture({ holdApply = false } = {}) {
+  const broker = new SnapshotBroker(), children = [], commands = [], release = deferred();
+  let saved = { version: 1, codes: ['AltRight', 'KeyS'] };
+  const native = new NativeBridge(broker, { helperPath: fileURLToPath(import.meta.url), spawn: () => {
+    const child = childFixture(); children.push(child);
+    child.stdin.on('data', chunk => {
+      const frame = JSON.parse(chunk.toString()); commands.push(frame);
+      const reply = () => child.stdout.write(JSON.stringify({ type: 'result', id: frame.id, ok: true,
+        ...(frame.method === 'setShortcut' ? { shortcut: frame.shortcut } : frame.method === 'setRecording' ? { recording: frame.active } : { permissions: { inputMonitoring: true } }) }) + '\n');
+      if (holdApply && frame.method === 'setShortcut') void release.promise.then(reply); else reply();
+    });
+    queueMicrotask(() => child.stdout.write(JSON.stringify({ type: 'ready', protocol: 1, ready: true, recording: true, shortcut: defaultShortcut(), supportedCodes: supportedShortcutCodes() }) + '\n'));
+    return child;
+  } });
+  const settings = new ShortcutSettings(native, broker, { platform: 'darwin', store: { async load() { return saved; }, async save(value) { saved = value; } } });
+  return { broker, native, settings, children, commands, release, get saved() { return saved; }, dispose() { settings.dispose(); native.stop(); native.dispose(); } };
+}
+
+test('native handshake applies saved settings before readiness and fences early capture frames', async t => {
+  const f = configuredFixture({ holdApply: true }); t.after(() => f.dispose());
+  await f.native.start();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.broker.status.ready, false);
+  f.broker.poll('client', 'session', true);
+  f.children[0].stdout.write('{"type":"trigger","captureId":"too-early"}\n');
+  assert.equal(f.broker.items.size, 0);
+  f.release.resolve(); await f.native.waitReady();
+  assert.equal(f.broker.status.ready, true);
+  assert.deepEqual(f.broker.status.shortcut.codes, ['AltRight', 'KeyS']);
+  assert.deepEqual(f.commands.map(x => x.method), ['setRecording', 'setShortcut', 'setRecording']);
+  f.children[0].stdout.write('{"type":"trigger","captureId":"confirmed"}\n');
+  assert.equal(f.broker.items.size, 1);
+});
+
+test('authenticated host configuration route saves valid chords and reapplies them on restart', async t => {
+  const f = configuredFixture(); t.after(() => f.dispose()); await f.native.waitReady();
+  const handler = createHandler(f.broker, f.native, f.settings);
+  const call = body => handler(new Request('https://fixture/api/context-snapshot', { method: 'POST', body: JSON.stringify(body) }));
+  const single = await call({ op: 'setShortcut', revision: f.broker.status.shortcutRevision, shortcut: { version: 1, codes: ['F8'] } });
+  assert.equal(single.status, 400);
+  const chord = normalizeShortcut({ version: 1, codes: ['F9', 'F8'] });
+  const response = await call({ op: 'setShortcut', revision: f.broker.status.shortcutRevision, shortcut: chord });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).status.shortcut, chord);
+  assert.deepEqual(f.saved, chord);
+  await f.native.restart(); await f.native.waitReady();
+  assert.equal(f.children.length, 2);
+  assert.deepEqual(f.broker.status.shortcut, chord);
+  assert.equal((await call({ op: 'recording', recorderId: 'editor', active: true })).status, 200);
+  assert.equal(f.broker.status.recording, true);
+  assert.equal((await call({ op: 'recording', recorderId: 'editor', active: false })).status, 200);
+  assert.equal(f.broker.status.recording, false);
+});
+
+test('a helper with an unavailable keyboard tap never reports a configured ready state', async t => {
+  const broker = new SnapshotBroker(), child = childFixture();
+  const native = new NativeBridge(broker, { helperPath: fileURLToPath(import.meta.url), spawn: () => child });
+  t.after(() => { native.stop(); native.dispose(); });
+  await native.start(); child.stdout.write('{"type":"ready","protocol":1,"ready":false}\n');
+  await assert.rejects(native.waitReady(), /监听尚未就绪/);
+  assert.equal(broker.status.ready, false);
+});
+
+test('a ready frame queued before restart cannot initialize the replacement helper', async t => {
+  const first = childFixture(), second = childFixture(), calls = [];
+  let count = 0;
+  const native = new NativeBridge(new SnapshotBroker(), { helperPath: fileURLToPath(import.meta.url), spawn: () => ++count === 1 ? first : second,
+    onReady: async frame => { calls.push(frame.marker); } });
+  t.after(() => { native.stop(); native.dispose(); });
+  await native.start();
+  first.stdout.write('{"type":"ready","protocol":1,"marker":"old"}\n');
+  await native.restart();
+  second.stdout.write('{"type":"ready","protocol":1,"marker":"new"}\n');
+  await native.waitReady();
+  assert.deepEqual(calls, ['new']);
 });

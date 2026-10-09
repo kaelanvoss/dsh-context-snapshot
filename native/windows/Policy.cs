@@ -6,22 +6,143 @@ using System.Text.Json;
 
 namespace DshContextSnapshot;
 
-internal enum ControlKey { None, Left, Right }
+internal sealed record ShortcutConfiguration(int Version, string[] Codes);
 
-internal sealed class DualControlGesture
+internal static class ShortcutKeys
 {
-    private bool left;
-    private bool right;
-    private bool fired;
-    public bool Update(ControlKey key, bool down)
+    // Scan codes identify physical keys, independently of the active keyboard
+    // layout. Extended navigation keys differ from their numeric-pad peers.
+    private static readonly Dictionary<uint, string> ScanCodes = new()
     {
-        if (key == ControlKey.Left) left = down;
-        else if (key == ControlKey.Right) right = down;
-        else return false;
-        if (!left || !right) { fired = false; return false; }
-        if (fired) return false;
-        fired = true;
-        return true;
+        [0x01] = "Escape", [0x02] = "Digit1", [0x03] = "Digit2", [0x04] = "Digit3", [0x05] = "Digit4",
+        [0x06] = "Digit5", [0x07] = "Digit6", [0x08] = "Digit7", [0x09] = "Digit8", [0x0A] = "Digit9",
+        [0x0B] = "Digit0", [0x0C] = "Minus", [0x0D] = "Equal", [0x0E] = "Backspace", [0x0F] = "Tab",
+        [0x10] = "KeyQ", [0x11] = "KeyW", [0x12] = "KeyE", [0x13] = "KeyR", [0x14] = "KeyT",
+        [0x15] = "KeyY", [0x16] = "KeyU", [0x17] = "KeyI", [0x18] = "KeyO", [0x19] = "KeyP",
+        [0x1A] = "BracketLeft", [0x1B] = "BracketRight", [0x1C] = "Enter", [0x1D] = "ControlLeft",
+        [0x1E] = "KeyA", [0x1F] = "KeyS", [0x20] = "KeyD", [0x21] = "KeyF", [0x22] = "KeyG",
+        [0x23] = "KeyH", [0x24] = "KeyJ", [0x25] = "KeyK", [0x26] = "KeyL", [0x27] = "Semicolon",
+        [0x28] = "Quote", [0x29] = "Backquote", [0x2A] = "ShiftLeft", [0x2B] = "Backslash",
+        [0x2C] = "KeyZ", [0x2D] = "KeyX", [0x2E] = "KeyC", [0x2F] = "KeyV", [0x30] = "KeyB",
+        [0x31] = "KeyN", [0x32] = "KeyM", [0x33] = "Comma", [0x34] = "Period", [0x35] = "Slash",
+        [0x36] = "ShiftRight", [0x37] = "NumpadMultiply", [0x38] = "AltLeft", [0x39] = "Space",
+        [0x3B] = "F1", [0x3C] = "F2", [0x3D] = "F3", [0x3E] = "F4", [0x3F] = "F5",
+        [0x40] = "F6", [0x41] = "F7", [0x42] = "F8", [0x43] = "F9", [0x44] = "F10",
+        [0x47] = "Numpad7", [0x48] = "Numpad8", [0x49] = "Numpad9", [0x4A] = "NumpadSubtract",
+        [0x4B] = "Numpad4", [0x4C] = "Numpad5", [0x4D] = "Numpad6", [0x4E] = "NumpadAdd",
+        [0x4F] = "Numpad1", [0x50] = "Numpad2", [0x51] = "Numpad3", [0x52] = "Numpad0",
+        [0x53] = "NumpadDecimal", [0x56] = "IntlBackslash", [0x57] = "F11", [0x58] = "F12",
+    };
+    private static readonly Dictionary<uint, string> ExtendedScanCodes = new()
+    {
+        [0x1C] = "NumpadEnter", [0x1D] = "ControlRight", [0x35] = "NumpadDivide", [0x38] = "AltRight",
+        [0x47] = "Home", [0x48] = "ArrowUp", [0x49] = "PageUp", [0x4B] = "ArrowLeft",
+        [0x4D] = "ArrowRight", [0x4F] = "End", [0x50] = "ArrowDown", [0x51] = "PageDown",
+        [0x52] = "Insert", [0x53] = "Delete", [0x5B] = "MetaLeft", [0x5C] = "MetaRight",
+    };
+    public static readonly string[] SupportedCodes = ScanCodes.Values.Concat(ExtendedScanCodes.Values)
+        .Concat(Enumerable.Range(1, 24).Select(number => "F" + number))
+        .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    private static readonly HashSet<string> Supported = new(SupportedCodes, StringComparer.Ordinal);
+
+    public static bool IsInjected(uint flags) => (flags & 0x12) != 0;
+
+    public static string? Resolve(uint virtualKey, uint scanCode, uint flags)
+    {
+        // Some keyboards report F13-F24 without the usual physical scan codes.
+        if (virtualKey is >= 0x70 and <= 0x87) return "F" + (virtualKey - 0x70 + 1);
+        if (virtualKey == 0xA0) return "ShiftLeft";
+        if (virtualKey == 0xA1) return "ShiftRight";
+        if (virtualKey == 0xA2) return "ControlLeft";
+        if (virtualKey == 0xA3) return "ControlRight";
+        if (virtualKey == 0xA4) return "AltLeft";
+        if (virtualKey == 0xA5) return "AltRight";
+        if (virtualKey == 0x5B) return "MetaLeft";
+        if (virtualKey == 0x5C) return "MetaRight";
+        var extended = (flags & 1) != 0;
+        if (virtualKey == 0x11) return extended ? "ControlRight" : "ControlLeft";
+        if (virtualKey == 0x12) return extended ? "AltRight" : "AltLeft";
+        if (virtualKey == 0x10) return scanCode == 0x36 ? "ShiftRight" : "ShiftLeft";
+        return (extended ? ExtendedScanCodes : ScanCodes).GetValueOrDefault(scanCode);
+    }
+
+    public static ShortcutConfiguration Validate(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Object
+            || !value.TryGetProperty("version", out var version) || !version.TryGetInt32(out var number) || number != 1
+            || !value.TryGetProperty("codes", out var codes) || codes.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("Shortcut must have version 1 and an array of physical key codes.");
+        var keys = new List<string>();
+        var unique = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var valueCode in codes.EnumerateArray())
+        {
+            if (valueCode.ValueKind != JsonValueKind.String || valueCode.GetString() is not { } code || !Supported.Contains(code))
+                throw new InvalidOperationException("Shortcut contains an unsupported physical key code.");
+            if (!unique.Add(code)) throw new InvalidOperationException("Shortcut must use distinct physical keys.");
+            keys.Add(code);
+        }
+        if (keys.Count < 2) throw new InvalidOperationException("Shortcut requires at least two distinct physical keys.");
+        return new ShortcutConfiguration(1, keys.ToArray());
+    }
+}
+
+internal sealed class ShortcutGesture
+{
+    private readonly object sync = new();
+    private readonly HashSet<string> pressed = new(StringComparer.Ordinal);
+    private readonly HashSet<string> blockedUntilRelease = new(StringComparer.Ordinal);
+    private ShortcutConfiguration configuration = new(1, ["ControlLeft", "ControlRight"]);
+    private HashSet<string> binding = new(["ControlLeft", "ControlRight"], StringComparer.Ordinal);
+    private bool fired;
+    private bool recording;
+    public ShortcutConfiguration Configuration
+    {
+        get { lock (sync) return new(configuration.Version, (string[])configuration.Codes.Clone()); }
+    }
+    public void Configure(JsonElement value)
+    {
+        // Validate before taking ownership: a rejected update keeps the old
+        // binding and its press state intact.
+        var validated = ShortcutKeys.Validate(value);
+        lock (sync)
+        {
+            configuration = validated;
+            binding = new(validated.Codes, StringComparer.Ordinal);
+            ResetForTransition();
+        }
+    }
+    public void SetRecording(bool active)
+    {
+        lock (sync)
+        {
+            recording = active;
+            ResetForTransition();
+        }
+    }
+    private void ResetForTransition()
+    {
+        blockedUntilRelease.UnionWith(pressed);
+        pressed.Clear();
+        fired = false;
+    }
+    public bool Update(string? code, bool down)
+    {
+        if (code == null) return false;
+        lock (sync)
+        {
+            if (!down)
+            {
+                blockedUntilRelease.Remove(code);
+                pressed.Remove(code);
+                if (binding.Contains(code)) fired = false;
+                return false;
+            }
+            if (recording) { blockedUntilRelease.Add(code); return false; }
+            if (blockedUntilRelease.Contains(code) || !pressed.Add(code)) return false;
+            if (fired || blockedUntilRelease.Count != 0 || !pressed.SetEquals(binding)) return false;
+            fired = true;
+            return true;
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 import { SnapshotBroker } from './broker.mjs';
 import { NativeBridge } from './native.mjs';
+import { ShortcutSettings } from './shortcut-settings.mjs';
 export const name = 'dsh-context-snapshot';
 export const inject = ['connection'];
 
@@ -14,7 +15,8 @@ async function readBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-export function createHandler(broker, native) {
+export function createHandler(broker, native, shortcuts) {
+  if (shortcuts) broker.status.shortcutApiVersion = 1;
   return async request => {
     try {
       const body = await readBody(request);
@@ -23,6 +25,14 @@ export function createHandler(broker, native) {
       if (body.op === 'start') { await native.start(); return json({ status: broker.status }); }
       if (body.op === 'restart') { await native.restart(); return json({ status: broker.status }); }
       if (body.op === 'permissions' || body.op === 'requestPermissions') return json({ permissions: await native.request(body.op), status: broker.status });
+      if (body.op === 'setShortcut') {
+        if (!shortcuts || typeof body.revision !== 'string') return json({ error: '快捷键设置不可用，请重启插件。' }, 400);
+        return json({ status: await shortcuts.save(body.shortcut, body.revision) });
+      }
+      if (body.op === 'recording') {
+        if (!shortcuts || !validId(body.recorderId) || typeof body.active !== 'boolean') return json({ error: 'Invalid shortcut recorder' }, 400);
+        return json({ status: await shortcuts.recording(body.recorderId, body.active) });
+      }
       if (!validId(body.clientId) || !validId(body.sessionId)) return json({ error: 'Invalid draft identity' }, 400);
       if (body.op === 'poll') {
         if (!validId(body.viewId ?? body.clientId) || !Number.isSafeInteger(body.generation ?? 0) || (body.generation ?? 0) < 0) return json({ error: 'Invalid draft generation' }, 400);
@@ -39,7 +49,8 @@ export function createHandler(broker, native) {
 export function apply(ctx, config = {}) {
   const broker = new SnapshotBroker();
   const native = new NativeBridge(broker, { helperPath: config.helperPath });
-  ctx.connection.fetch.register({ path: '/api/context-snapshot', methods: ['POST'], requestBody: 'buffered', fetch: createHandler(broker, native) });
-  ctx.effect(() => () => { native.dispose(); broker.dispose(); });
+  const shortcuts = new ShortcutSettings(native, broker);
+  ctx.connection.fetch.register({ path: '/api/context-snapshot', methods: ['POST'], requestBody: 'buffered', fetch: createHandler(broker, native, shortcuts) });
+  ctx.effect(() => () => { shortcuts.dispose(); native.dispose(); broker.dispose(); });
   if (config.autoStart !== false) native.start();
 }

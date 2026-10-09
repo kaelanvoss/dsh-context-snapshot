@@ -27,5 +27,6 @@ await Promise.all([
   fetchFixture('dsh-client-ui-slots', 'lib/index.js', '.fixtures/ui-slots/index.js'),
   fetchFixture('dsh-client-ui-renderer', 'lib/client.js', '.fixtures/ui-renderer/client.js'),
   fetchFixture('dsh-client-ui-chat', 'lib/client.js', '.fixtures/ui-chat/client.js'),
+  fetchFixture('dsh-client-shortcuts', 'lib/client.js', '.fixtures/shortcuts/client.js'),
 ]);
-console.log('Fetched integrity-checked official 0.2.0-rc.2 input, chat, slots, renderer and Connection contracts.');
+console.log('Fetched integrity-checked official 0.2.0-rc.2 input, chat, slots, renderer, shortcuts and Connection contracts.');

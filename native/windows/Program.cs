@@ -26,7 +26,7 @@ internal static class Program
     private static readonly object WorkerLock = new();
     private static readonly HashSet<Process> Workers = [];
     private static readonly SemaphoreSlim CaptureGate = new(1, 1);
-    private static readonly DualControlGesture Gesture = new();
+    private static readonly ShortcutGesture Gesture = new();
     private static readonly Native.HookProc HookCallback = KeyboardHook;
     private static nint hook;
     private static uint messageThread;
@@ -77,6 +77,9 @@ internal static class Program
             return 2;
         }
 
+        // The host restores its saved shortcut after ready. Keep keyboard
+        // capture paused until that configuration handshake explicitly ends.
+        Gesture.SetRecording(true);
         messageThread = Native.GetCurrentThreadId();
         // Create the queue before the stdin reader can post WM_QUIT.
         Native.PeekMessage(out _, 0, 0, 0, 0);
@@ -88,7 +91,7 @@ internal static class Program
         }
         Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; Shutdown(); };
         _ = Task.Run(ReadCommands);
-        Write(new { type = "ready", protocol = 1, platform = "win32" });
+        Write(new { type = "ready", protocol = 1, platform = "win32", shortcut = Gesture.Configuration, supportedCodes = ShortcutKeys.SupportedCodes, recording = true });
         try { Application.Run(); }
         finally
         {
@@ -104,11 +107,14 @@ internal static class Program
         if (code >= 0 && Volatile.Read(ref stopping) == 0)
         {
             var input = Marshal.PtrToStructure<Native.KeyboardInput>(data);
-            if ((input.flags & 0x10) == 0 && (message == 0x100 || message == 0x104 || message == 0x101 || message == 0x105))
+            if (!ShortcutKeys.IsInjected(input.flags) && (message == 0x100 || message == 0x104 || message == 0x101 || message == 0x105))
             {
-                var key = ResolveControl(input.vkCode, input.flags);
+                // Track unbound physical keys too: extra pressed keys must not
+                // turn a larger combination into the configured shortcut.
+                var key = ShortcutKeys.Resolve(input.vkCode, input.scanCode, input.flags)
+                    ?? $"Unmapped:{input.vkCode}:{input.scanCode}:{input.flags & 1}";
                 var down = message == 0x100 || message == 0x104;
-                if (key != ControlKey.None && Gesture.Update(key, down))
+                if (Gesture.Update(key, down))
                 {
                     var target = Native.GetForegroundWindow();
                     var captureId = Guid.NewGuid().ToString("D");
@@ -118,14 +124,6 @@ internal static class Program
         }
         return Native.CallNextHookEx(hook, code, message, data);
     }
-
-    private static ControlKey ResolveControl(uint key, uint flags) => key switch
-    {
-        0xA2 => ControlKey.Left,
-        0xA3 => ControlKey.Right,
-        0x11 => (flags & 1) == 0 ? ControlKey.Left : ControlKey.Right,
-        _ => ControlKey.None,
-    };
 
     private static async Task ReadCommands()
     {
@@ -152,6 +150,15 @@ internal static class Program
                         case "permissions":
                         case "requestPermissions":
                             Write(new { type = "result", id, ok = true, permissions = new { screenRecording = true, accessibility = true, inputMonitoring = true } });
+                            break;
+                        case "setShortcut":
+                            Gesture.Configure(request.GetProperty("shortcut"));
+                            Write(new { type = "result", id, ok = true, shortcut = Gesture.Configuration });
+                            break;
+                        case "setRecording":
+                            var active = request.GetProperty("active").GetBoolean();
+                            Gesture.SetRecording(active);
+                            Write(new { type = "result", id, ok = true, recording = active });
                             break;
                         case "shutdown":
                             Write(new { type = "result", id, ok = true });
@@ -594,23 +601,36 @@ internal static class Program
         }
         try
         {
-            var state = new DualControlGesture();
-            Assert(!state.Update(ControlKey.Left, true), "Left Ctrl alone must not capture.");
-            Assert(state.Update(ControlKey.Right, true), "Both Ctrl keys must capture once.");
-            Assert(!state.Update(ControlKey.Right, true), "Key repeat must not capture.");
-            Assert(!state.Update(ControlKey.Left, true), "Holding both keys must not repeat.");
-            Assert(!state.Update(ControlKey.Right, false), "Releasing a key must not capture.");
-            Assert(state.Update(ControlKey.Right, true), "Re-press after release must capture.");
-            Assert(!state.Update(ControlKey.Left, false), "Left release resets the gesture.");
-            Assert(!state.Update(ControlKey.Right, false), "Both releases must not capture.");
-            Assert(!state.Update(ControlKey.Right, true), "Right Ctrl alone must not capture.");
-            Assert(state.Update(ControlKey.Left, true), "Reverse press order must capture.");
+            var state = new ShortcutGesture();
+            Assert(!state.Update("ControlLeft", true), "Left Ctrl alone must not capture.");
+            Assert(state.Update("ControlRight", true), "Both Ctrl keys must capture once.");
+            Assert(!state.Update("ControlRight", true), "Key repeat must not capture.");
+            Assert(!state.Update("ControlLeft", true), "Holding both keys must not repeat.");
+            Assert(!state.Update("ControlRight", false), "Releasing a key must not capture.");
+            Assert(state.Update("ControlRight", true), "Re-press after release must capture.");
+            Assert(!state.Update("ControlLeft", false), "Left release resets the gesture.");
+            Assert(!state.Update("ControlRight", false), "Both releases must not capture.");
+            Assert(!state.Update("ControlRight", true), "Right Ctrl alone must not capture.");
+            Assert(state.Update("ControlLeft", true), "Reverse press order must capture.");
+            using var custom = JsonDocument.Parse("{\"version\":1,\"codes\":[\"ControlLeft\",\"ShiftRight\",\"KeyS\"]}");
+            state.Configure(custom.RootElement);
+            Assert(!state.Update("KeyS", true) && !state.Update("ShiftRight", true), "A partial custom chord must not capture.");
+            Assert(!state.Update("ControlLeft", true), "Keys held across reconfiguration must be released first.");
+            state.Update("ControlLeft", false);
+            state.Update("ControlRight", false);
+            Assert(state.Update("ControlLeft", true), "A complete custom chord captures after release.");
+            state.SetRecording(true);
+            Assert(!state.Update("KeyS", true), "Recording suspends capture.");
+            state.SetRecording(false);
+            Assert(!state.Update("ControlLeft", true), "Keys held through recording must not capture on repeat.");
+            foreach (var key in custom.RootElement.GetProperty("codes").EnumerateArray()) state.Update(key.GetString(), false);
+            Assert(!state.Update("ControlLeft", true) && !state.Update("ShiftRight", true) && state.Update("KeyS", true), "Recording cleanup permits the next fresh chord.");
             Assert(TargetPolicy.IsExcluded("DeepSeek.exe"), "DSH must not capture itself.");
             Assert(TargetPolicy.IsExcluded("dsh-context-snapshot"), "Helper must not capture itself.");
             Assert(!TargetPolicy.IsExcluded("deepseek-notes"), "Do not exclude unrelated process names by substring.");
             Assert(!TargetPolicy.IsExcluded("chrome"), "Browsers must remain eligible.");
-            Assert(ResolveControl(0x11, 1) == ControlKey.Right, "Extended generic Ctrl is right Ctrl.");
-            Assert(ResolveControl(0x11, 0) == ControlKey.Left, "Non-extended generic Ctrl is left Ctrl.");
+            Assert(ShortcutKeys.Resolve(0x11, 0x1D, 1) == "ControlRight", "Extended generic Ctrl is right Ctrl.");
+            Assert(ShortcutKeys.Resolve(0x11, 0x1D, 0) == "ControlLeft", "Non-extended generic Ctrl is left Ctrl.");
             var intersection = Intersect(new Native.Rect(0, 0, 100, 100), new Native.Rect(10, 20, 90, 80));
             Assert(intersection.Width == 80 && intersection.Height == 60, "Crop must remain within the target window.");
             using var iconSource = new Bitmap(16, 16, PixelFormat.Format32bppArgb);
