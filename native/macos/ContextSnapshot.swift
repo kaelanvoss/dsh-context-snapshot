@@ -54,7 +54,7 @@ private struct ShortcutConfiguration {
         guard let object = value as? [String: Any],
               let version = object["version"] as? NSNumber,
               CFGetTypeID(version) != CFBooleanGetTypeID(), version.doubleValue == 1,
-              let codes = object["codes"] as? [String], codes.count >= 2,
+              let codes = object["codes"] as? [String], codes.count == 2,
               Set(codes).count == codes.count, codes.allSatisfy({ supportedCodes.contains($0) }) else { return nil }
         return ShortcutConfiguration(codes: codes)
     }
@@ -118,6 +118,66 @@ private struct ShortcutState {
 private struct CaptureFailure: Error {
     let code: String
     let message: String
+}
+
+/// One bounded, explicit recorder lease. Only the current combination and its
+/// maximum simultaneous set exist; no character, sequence or durable history.
+private struct PhysicalShortcutRecorder {
+    private(set) var token: String?
+    private(set) var state = "ended"
+    private var current = Set<String>()
+    private var peak = Set<String>()
+    private var deadline = 0.0
+    private var released = false
+    var active: Bool { token != nil && ["waiting", "holding"].contains(state) }
+    var tracked: Set<String> { current }
+    var object: [String: Any] {
+        ["token": token ?? "", "state": state, "current": current.sorted(), "peak": peak.sorted()]
+    }
+    mutating func begin(token value: String, now: Double, focused: Bool, held: Set<String>) throws {
+        guard value.count >= 16, value.count <= 128, value != token else {
+            throw CaptureFailure(code: "INVALID_RECORDING_TOKEN", message: "Recording requires a fresh short token")
+        }
+        guard focused else { throw CaptureFailure(code: "RECORDING_NOT_FOCUSED", message: "Keep DeepSeek Harness in the foreground while recording") }
+        guard held.isEmpty else { throw CaptureFailure(code: "KEYS_ALREADY_HELD", message: "Release every key before starting a new recording") }
+        token = value; state = "waiting"; current.removeAll(); peak.removeAll()
+        deadline = now + 15; released = false
+    }
+    mutating func check(now: Double, focused: Bool) {
+        guard active else { return }
+        if now >= deadline { state = "expired"; current.removeAll(); peak.removeAll() }
+        else if !focused { state = "interrupted"; current.removeAll(); peak.removeAll() }
+    }
+    mutating func update(code: String, down: Bool, now: Double, focused: Bool) {
+        check(now: now, focused: focused)
+        guard state == "waiting" || state == "holding" else { return }
+        guard supportedCodes.contains(code) else {
+            state = "interrupted"; current.removeAll(); peak.removeAll(); return
+        }
+        if down {
+            guard !released else { return }
+            if !current.contains(code) && current.count == 2 {
+                state = "too_many"; current.removeAll(); peak.removeAll(); return
+            }
+            current.insert(code)
+            if current.count > peak.count { peak = current }
+            state = "holding"
+        } else if current.remove(code) != nil {
+            // A release closes simultaneous growth. A later key cannot be
+            // merged into a candidate that was never held all at once.
+            released = true
+            if current.isEmpty { state = "complete" }
+        }
+    }
+    mutating func end(clearToken: Bool = false) {
+        state = "ended"; current.removeAll(); peak.removeAll(); released = false
+        if clearToken { token = nil }
+    }
+    func require(_ value: String?) throws {
+        guard let value, !value.isEmpty, value == token else {
+            throw CaptureFailure(code: "INVALID_RECORDING_TOKEN", message: "This recording lease is no longer current")
+        }
+    }
 }
 
 private final class JSONWriter: @unchecked Sendable {
@@ -296,10 +356,68 @@ private struct AXElementIdentity: Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }
 }
 
+/// A verified parent route may expose its next child even when child enumeration
+/// fails. Call only after the parent's privacy and budget checks; the scheduled
+/// child still receives those same checks on its regular visit.
+private func additionalRootedFocusChild(_ focusChild: AXUIElement?,
+                                       enumeratedChildren: [AXUIElement]?) -> AXUIElement? {
+    guard let focusChild,
+          enumeratedChildren?.contains(where: { CFEqual($0, focusChild) }) != true else { return nil }
+    return focusChild
+}
+
+private func captureTimestamp() -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: Date())
+}
+
+private struct AccessibleCapture {
+    var text = ""
+    var reasons = Set<String>()
+    var source: [String: String] = [:]
+    var nodeCount = 0
+    let startedAt = captureTimestamp()
+    var finishedAt = ""
+    var quality: [String: Any] {
+        ["status": text.isEmpty ? "image_only" : reasons.isEmpty ? "available" : "partial",
+         "reasons": reasons.sorted(), "textSource": "ax", "nodeCount": nodeCount,
+         "scope": "ax_visible_children_when_available"]
+    }
+}
+
+private func nodePriority(role: String?, subrole: String?, focusedPath: Bool, selected: Bool = false) -> Int {
+    if focusedPath { return 0 }
+    if selected { return 1 }
+    if role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" { return 2 }
+    if role == "AXWebArea" || role == "AXDocument" { return 3 }
+    return 4
+}
+
+private func verifiedSourceURL(_ value: CFTypeRef?) -> String? {
+    let raw: String?
+    if let string = value as? String { raw = string }
+    else if let value, CFGetTypeID(value) == CFURLGetTypeID() { raw = CFURLGetString((value as! CFURL)) as String }
+    else { raw = nil }
+    guard let raw, raw.utf16.count <= 2048, let url = URL(string: raw),
+          ["https", "http", "file"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+    return raw
+}
+
 /// A bounded capture-time AX tree, not OCR or a live inspector. Password and
 /// reported-hidden subtrees are excluded before asking for any text values.
-private func collectWindowText(_ window: AXUIElement?) -> String {
-    guard let window, AXIsProcessTrusted() else { return "" }
+private func collectWindowText(_ window: AXUIElement?, pid: pid_t) -> AccessibleCapture {
+    var result = AccessibleCapture()
+    guard AXIsProcessTrusted() else {
+        result.reasons.insert("accessibility_permission_denied")
+        result.finishedAt = captureTimestamp()
+        return result
+    }
+    guard let window else {
+        result.reasons.insert("accessibility_unavailable")
+        result.finishedAt = captureTimestamp()
+        return result
+    }
     AXUIElementSetMessagingTimeout(window, 0.025)
     let deadline = ProcessInfo.processInfo.systemUptime + 1.0
     var stack: [(AXUIElement, Int)] = [(window, 0)]
@@ -312,13 +430,40 @@ private func collectWindowText(_ window: AXUIElement?) -> String {
         kAXHelpAttribute, kAXValueAttribute, kAXValueDescriptionAttribute, kAXSelectedTextAttribute,
         kAXSelectedTextRangeAttribute, kAXEnabledAttribute, kAXFocusedAttribute, kAXSelectedAttribute,
         kAXExpandedAttribute, kAXURLAttribute].map { $0 as String }
+    // Follow only parent identities before reading content. A focus route is
+    // admitted only when it reaches this captured window; normal privacy checks
+    // still run on every ancestor before its descendants can be visited.
+    var focusPath = Set<AXElementIdentity>()
+    var focusChildren: [AXElementIdentity: AXUIElement] = [:]
+    let application = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(application, 0.025)
+    if let focused = axValue(application, kAXFocusedUIElementAttribute as CFString),
+       CFGetTypeID(focused) == AXUIElementGetTypeID() {
+        var current = focused as! AXUIElement
+        var route = Set<AXElementIdentity>()
+        var children: [AXElementIdentity: AXUIElement] = [:]
+        for _ in 0..<40 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  route.insert(AXElementIdentity(element: current)).inserted else { break }
+            AXUIElementSetMessagingTimeout(current, 0.025)
+            if CFEqual(current, window) { focusPath = route; focusChildren = children; break }
+            guard let parent = axValue(current, kAXParentAttribute as CFString),
+                  CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            let parentElement = parent as! AXUIElement
+            children[AXElementIdentity(element: parentElement)] = current
+            current = parentElement
+        }
+    }
     while let (element, depth) = stack.popLast() {
-        guard nodeCount < 300, textUnits < maximumTextCharacters,
-              ProcessInfo.processInfo.systemUptime < deadline else { break }
+        if nodeCount >= 300 { result.reasons.insert("node_budget_reached"); break }
+        if textUnits >= maximumTextCharacters { result.reasons.insert("text_budget_reached"); break }
+        if ProcessInfo.processInfo.systemUptime >= deadline { result.reasons.insert("time_budget_reached"); break }
         guard seen.insert(AXElementIdentity(element: element)).inserted else { continue }
         nodeCount += 1
         AXUIElementSetMessagingTimeout(element, 0.025)
-        guard let security = axBatch(element, securityAttributes) else { continue }
+        guard let security = axBatch(element, securityAttributes) else {
+            result.reasons.insert("provider_read_failed"); continue
+        }
         let role = security[kAXRoleAttribute as String] as? String
         let subrole = security[kAXSubroleAttribute as String] as? String
         // An unsupported/no-value optional attribute is different from a failed
@@ -326,9 +471,23 @@ private func collectWindowText(_ window: AXUIElement?) -> String {
         guard optionalAXSafetyValue(security[kAXSubroleAttribute as String], boolean: false),
             optionalAXSafetyValue(security[kAXHiddenAttribute as String], boolean: true),
             readableAXNode(role: role, subrole: subrole,
-            hidden: axBoolean(security[kAXHiddenAttribute as String])), let role else { continue }
-        guard ProcessInfo.processInfo.systemUptime < deadline else { break }
-        let values = axBatch(element, valueAttributes) ?? [:]
+            hidden: axBoolean(security[kAXHiddenAttribute as String])), let role else {
+            if role != "AXSecureTextField", subrole != "AXSecureTextField",
+               axBoolean(security[kAXHiddenAttribute as String]) != true {
+                result.reasons.insert("provider_read_failed")
+            }
+            continue
+        }
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+            result.reasons.insert("time_budget_reached"); break
+        }
+        let values: [String: CFTypeRef]
+        if let read = axBatch(element, valueAttributes) { values = read }
+        else { values = [:]; result.reasons.insert("provider_read_failed") }
+        if values.values.contains(where: {
+            guard let error = axAttributeError($0) else { return false }
+            return error != .attributeUnsupported && error != .noValue
+        }) { result.reasons.insert("provider_read_failed") }
         var states: [(String, String)] = []
         for (name, attribute) in [("enabled", kAXEnabledAttribute), ("focused", kAXFocusedAttribute),
             ("selected", kAXSelectedAttribute), ("expanded", kAXExpandedAttribute)] {
@@ -343,8 +502,28 @@ private func collectWindowText(_ window: AXUIElement?) -> String {
             ("Value", kAXValueAttribute), ("Value description", kAXValueDescriptionAttribute),
             ("Selected text", kAXSelectedTextAttribute), ("URL", kAXURLAttribute)] {
             let maximum = attribute == kAXTitleAttribute ? 256 : 1024
+            if let raw = values[attribute as String] as? String, raw.count > maximum {
+                result.reasons.insert("field_truncated")
+            }
             if let value = axScalar(values[attribute as String], maximum: maximum,
                 preserveEmpty: attribute == kAXValueAttribute) { fields.append((name, value)) }
+        }
+        if axBoolean(values[kAXFocusedAttribute as String]) == true {
+            result.source["focusedRole"] = role
+            if let name = values[kAXTitleAttribute as String] as? String
+                ?? values[kAXDescriptionAttribute as String] as? String, !name.isEmpty {
+                result.source["focusedName"] = boundedUTF16Text(name, maximum: 256)
+                if result.source["focusedName"] != name { result.reasons.insert("field_truncated") }
+            }
+        }
+        if let selected = values[kAXSelectedTextAttribute as String] as? String, !selected.isEmpty,
+           result.source["selectedText"] == nil || axBoolean(values[kAXFocusedAttribute as String]) == true {
+            result.source["selectedText"] = boundedUTF16Text(selected, maximum: 1024)
+            if result.source["selectedText"] != selected { result.reasons.insert("field_truncated") }
+        }
+        if ["AXWebArea", "AXDocument", "AXWindow"].contains(role),
+           let url = verifiedSourceURL(values[kAXURLAttribute as String]), result.source["url"] == nil {
+            result.source["url"] = url
         }
         if let range = axSelectedRange(values[kAXSelectedTextRangeAttribute as String]) {
             fields.append(("Selected range", range))
@@ -352,24 +531,81 @@ private func collectWindowText(_ window: AXUIElement?) -> String {
         let line = accessibilityTreeLine(role: role, subrole: subrole, depth: depth, states: states, fields: fields)
         let remaining = maximumTextCharacters - textUnits
         let bounded = boundedUTF16Text(line, maximum: remaining - (fragments.isEmpty ? 0 : 1))
+        if bounded != line { result.reasons.insert("text_budget_reached") }
         if !bounded.isEmpty { fragments.append(bounded); textUnits += bounded.utf16.count + (fragments.count > 1 ? 1 : 0) }
         guard nodeCount < 300, textUnits < maximumTextCharacters,
               ProcessInfo.processInfo.systemUptime < deadline else { continue }
         // Ask for only the remaining node budget, and use the provider's visible
         // children when it supports them. Do not expand giant full child arrays.
         var childValues: CFArray?
+        var childAttribute = kAXVisibleChildrenAttribute as CFString
         var childResult = AXUIElementCopyAttributeValues(element, kAXVisibleChildrenAttribute as CFString,
             0, 300 - nodeCount, &childValues)
         if childResult == .attributeUnsupported {
             guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+            childAttribute = kAXChildrenAttribute as CFString
             childResult = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString,
                 0, 300 - nodeCount, &childValues)
         }
-        if childResult == .success, let children = childValues as? [AXUIElement] {
-            stack.append(contentsOf: children.reversed().map { ($0, depth + 1) })
+        let children = childResult == .success ? childValues as? [AXUIElement] : nil
+        let focusChild = focusChildren[AXElementIdentity(element: element)]
+        let additionalFocusChild = additionalRootedFocusChild(focusChild, enumeratedChildren: children)
+        if let children {
+            var ranked: [(AXUIElement, Int, Int)] = []
+            // A known rooted focus child remains first even when the provider's
+            // bounded child slice ended before it. Its safety is still checked
+            // by the regular visit, including secure/hidden ancestor exclusion.
+            if let additionalFocusChild {
+                ranked.append((additionalFocusChild, 0, -1))
+            }
+            let rankingDeadline = focusChild == nil
+                ? min(deadline, ProcessInfo.processInfo.systemUptime + 0.075)
+                : ProcessInfo.processInfo.systemUptime
+            for (index, child) in children.enumerated() {
+                if ProcessInfo.processInfo.systemUptime >= deadline {
+                    result.reasons.insert("time_budget_reached")
+                    ranked.append(contentsOf: children[index...].enumerated().map { ($0.element, 4, index + $0.offset) })
+                    break
+                }
+                if focusPath.contains(AXElementIdentity(element: child)) {
+                    ranked.append((child, 0, index)); continue
+                }
+                // Ranking has a small independent time allowance so unrelated
+                // siblings cannot spend the focus route's entire read budget.
+                if index >= 24 || ProcessInfo.processInfo.systemUptime >= rankingDeadline {
+                    ranked.append((child, 4, index)); continue
+                }
+                // Ranking reads only roles, never labels or text of unchecked
+                // descendants. Content and child enumeration remain fail closed.
+                AXUIElementSetMessagingTimeout(child, 0.025)
+                let labels = axBatch(child, [kAXRoleAttribute as String, kAXSubroleAttribute as String, kAXSelectedAttribute as String])
+                ranked.append((child, nodePriority(role: labels?[kAXRoleAttribute as String] as? String,
+                    subrole: labels?[kAXSubroleAttribute as String] as? String, focusedPath: false,
+                    selected: axBoolean(labels?[kAXSelectedAttribute as String]) == true), index))
+            }
+            let ordered = ranked.sorted { $0.1 == $1.1 ? $0.2 < $1.2 : $0.1 < $1.1 }
+            stack.append(contentsOf: ordered.reversed().map { ($0.0, depth + 1) })
+            var childCount: CFIndex = 0
+            if AXUIElementGetAttributeValueCount(element, childAttribute, &childCount) == .success,
+               childCount > children.count { result.reasons.insert("node_budget_reached") }
+        } else {
+            if childResult != .attributeUnsupported && childResult != .noValue {
+                result.reasons.insert("provider_read_failed")
+            }
+            // Failure to enumerate siblings must not discard a separately
+            // verified focus route. This does not make the capture complete or
+            // bypass secure/hidden checks on the next visit.
+            if let additionalFocusChild { stack.append((additionalFocusChild, depth + 1)) }
         }
     }
-    return boundedText(fragments)
+    result.text = boundedText(fragments)
+    result.nodeCount = nodeCount
+    if nodeCount >= 300 { result.reasons.insert("node_budget_reached") }
+    if textUnits >= maximumTextCharacters { result.reasons.insert("text_budget_reached") }
+    if ProcessInfo.processInfo.systemUptime >= deadline { result.reasons.insert("time_budget_reached") }
+    if result.text.isEmpty { result.reasons.insert("no_accessible_content") }
+    result.finishedAt = captureTimestamp()
+    return result
 }
 
 private struct WindowTarget {
@@ -378,6 +614,34 @@ private struct WindowTarget {
     let title: String
     let frame: CGRect
     let accessibilityWindow: AXUIElement?
+}
+
+private struct RecordingWindowIdentity: Equatable {
+    let pid: pid_t
+    let id: CGWindowID
+}
+
+/// WindowServer returns on-screen rows from front to back. Recording needs
+/// only the public owner/number/bounds fields, not a title or an AX grant.
+private func frontRecordingWindow(pid: pid_t, rows: [[String: Any]]) -> RecordingWindowIdentity? {
+    for row in rows {
+        guard (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+              (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+              (row[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0 > 0,
+              let id = row[kCGWindowNumber as String] as? NSNumber, id.uint32Value != 0,
+              let bounds = row[kCGWindowBounds as String] as? NSDictionary,
+              let frame = CGRect(dictionaryRepresentation: bounds), frame.width > 1, frame.height > 1 else { continue }
+        return RecordingWindowIdentity(pid: pid, id: CGWindowID(id.uint32Value))
+    }
+    return nil
+}
+
+private func validateCaptureTarget(_ target: WindowTarget) throws {
+    let current = try foregroundTarget()
+    guard current.app.processIdentifier == target.app.processIdentifier, current.id == target.id,
+          target.title.isEmpty || current.title.isEmpty || current.title == target.title else {
+        throw CaptureFailure(code: "WINDOW_CONTEXT_CHANGED", message: "The selected window changed during capture; capture it again")
+    }
 }
 
 private func isExcludedApplication(_ app: NSRunningApplication) -> Bool {
@@ -518,7 +782,9 @@ private func shareableContent() async throws -> ShareableContentSnapshot {
 @MainActor
 private func screenshot(_ target: WindowTarget) async throws -> CGImage {
     let content = try await shareableContent().value
-    guard let window = content.windows.first(where: { $0.windowID == target.id }) else {
+    guard let window = content.windows.first(where: {
+        $0.windowID == target.id && $0.owningApplication?.processID == target.app.processIdentifier
+    }) else {
         throw CaptureFailure(code: "WINDOW_CLOSED", message: "The selected foreground window closed before capture")
     }
     let filter = SCContentFilter(desktopIndependentWindow: window)
@@ -562,14 +828,52 @@ private final class SnapshotHelper: @unchecked Sendable {
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var capturing = false
+    private var recorder = PhysicalShortcutRecorder()
+    private var recorderTimer: Timer?
+    private var focusObserver: NSObjectProtocol?
+    private var recordingWindow: RecordingWindowIdentity?
+
+    private func harnessRecordingWindow() throws -> RecordingWindowIdentity {
+        guard let app = NSWorkspace.shared.frontmostApplication, let bundle = app.bundleIdentifier,
+              bundle == "com.deepseek.dsh" || bundle.hasPrefix("com.deepseek.dsh.") else {
+            throw CaptureFailure(code: "RECORDING_NOT_FOCUSED", message: "Keep the DeepSeek Harness recording window in the foreground")
+        }
+        guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]], let identity = frontRecordingWindow(pid: app.processIdentifier, rows: rows) else {
+            throw CaptureFailure(code: "RECORDING_WINDOW_UNAVAILABLE", message: "Cannot verify the foreground recording window; reopen the panel and retry")
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == identity.pid else {
+            throw CaptureFailure(code: "RECORDING_NOT_FOCUSED", message: "The foreground application changed before recording began")
+        }
+        return identity
+    }
+    private func recordingWindowFocused() -> Bool {
+        guard let recordingWindow else { return false }
+        return (try? harnessRecordingWindow()) == recordingWindow
+    }
+    private func checkRecorder() {
+        guard recorder.active else { return }
+        recorder.check(now: ProcessInfo.processInfo.systemUptime, focused: recordingWindowFocused())
+        // Command shortcuts can omit an ordinary keyUp. Only a direct physical
+        // state query for already recorded keys can close that release; no
+        // unobserved key or guessed modifier side enters the combination.
+        let held = currentlyHeldCodes()
+        for code in recorder.tracked where !held.contains(code) {
+            recorder.update(code: code, down: false, now: ProcessInfo.processInfo.systemUptime, focused: recordingWindowFocused())
+        }
+    }
 
     func start() {
         // The host restores preferences and recorder leases before it explicitly
         // resumes capture. Restarting during key recording cannot capture here.
         shortcutState.setRecording(true, blocking: currentlyHeldCodes().intersection(supportedCodes))
         installTap()
+        recorderTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.checkRecorder() }
+        focusObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.checkRecorder() }
         writer.send(["type": "ready", "protocol": 1, "platform": "darwin", "ready": tap != nil,
-                     "shortcut": shortcutState.shortcut.object, "supportedCodes": supportedCodes.sorted(), "recording": true])
+                     "shortcut": shortcutState.shortcut.object, "supportedCodes": supportedCodes.sorted(), "recording": true,
+                     "supportsShortcutRecording": true])
         DispatchQueue.global(qos: .utility).async { [weak self] in
             while let line = readLine() {
                 guard line.utf8.count <= 65_536 else {
@@ -593,6 +897,9 @@ private final class SnapshotHelper: @unchecked Sendable {
                 let helper = Unmanaged<SnapshotHelper>.fromOpaque(userData).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     helper.shortcutState.reset(blocking: helper.currentlyHeldCodes().intersection(supportedCodes))
+                    // A listener gap cannot yield a trustworthy current/peak
+                    // combination. Completed candidates are already frozen.
+                    helper.recorder.check(now: ProcessInfo.processInfo.systemUptime, focused: false)
                     if let tap = helper.tap { CGEvent.tapEnable(tap: tap, enable: true) }
                 } else if type == .flagsChanged || type == .keyDown || type == .keyUp {
                     let flags = event.flags.rawValue
@@ -602,6 +909,13 @@ private final class SnapshotHelper: @unchecked Sendable {
                     // while held, but can never be stored as a shortcut.
                     let code = type == .flagsChanged ? nil : physicalCodes[key] ?? "unmapped-\(key)"
                     let held = type == .flagsChanged ? helper.currentlyHeldCodes() : nil
+                    if helper.recorder.active {
+                        let physical = physicalCodes[key] ?? "unmapped-\(key)"
+                        let down = type == .flagsChanged ? held?.contains(physical) == true : type == .keyDown
+                        helper.recorder.update(code: physical, down: down, now: ProcessInfo.processInfo.systemUptime,
+                            focused: helper.recordingWindowFocused())
+                        if type == .flagsChanged { helper.checkRecorder() }
+                    }
                     if helper.shortcutState.update(code: code, down: type == .keyDown, modifiers: modifiers,
                         repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0, physicallyHeld: held) {
                         helper.capture(id: UUID().uuidString)
@@ -646,7 +960,7 @@ private final class SnapshotHelper: @unchecked Sendable {
         case "setShortcut":
             guard let shortcut = ShortcutConfiguration.parse(request["shortcut"]) else {
                 writer.send(["type": "result", "id": id, "ok": false,
-                    "error": ["code": "INVALID_SHORTCUT", "message": "Shortcut needs version 1 and at least two distinct supported physical keys"]])
+                    "error": ["code": "INVALID_SHORTCUT", "message": "Shortcut needs version 1 and exactly two distinct supported physical keys"]])
                 return
             }
             shortcutState.configure(shortcut, blocking: currentlyHeldCodes().intersection(supportedCodes))
@@ -659,7 +973,32 @@ private final class SnapshotHelper: @unchecked Sendable {
                 return
             }
             shortcutState.setRecording(value.boolValue, blocking: currentlyHeldCodes().intersection(supportedCodes))
+            if !value.boolValue { recorder.end(clearToken: true); recordingWindow = nil }
             writer.send(["type": "result", "id": id, "ok": true, "recording": shortcutState.recording])
+        case "beginShortcutRecording", "shortcutRecordingState", "endShortcutRecording":
+            do {
+                guard shortcutState.recording, tap != nil else {
+                    throw CaptureFailure(code: "RECORDING_NOT_READY", message: "Pause capture and confirm the listener before recording")
+                }
+                if method == "beginShortcutRecording" {
+                    guard let token = request["token"] as? String else {
+                        throw CaptureFailure(code: "INVALID_RECORDING_TOKEN", message: "Recording requires a fresh short token")
+                    }
+                    let window = try harnessRecordingWindow()
+                    try recorder.begin(token: token, now: ProcessInfo.processInfo.systemUptime,
+                        focused: true, held: currentlyHeldCodes())
+                    recordingWindow = window
+                } else {
+                    try recorder.require(request["token"] as? String)
+                    if method == "endShortcutRecording" { recorder.end(); recordingWindow = nil }
+                    else { checkRecorder() }
+                }
+                writer.send(["type": "result", "id": id, "ok": true, "recordingState": recorder.object])
+            } catch {
+                let failure = error as? CaptureFailure
+                writer.send(["type": "result", "id": id, "ok": false,
+                    "error": ["code": failure?.code ?? "RECORDING_FAILED", "message": failure?.message ?? error.localizedDescription]])
+            }
         case "requestPermissions":
             // Only this explicit request is permitted to present macOS privacy prompts.
             if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
@@ -693,18 +1032,24 @@ private final class SnapshotHelper: @unchecked Sendable {
                 throw CaptureFailure(code: "SCREEN_RECORDING_PERMISSION", message: "Grant Screen Recording to ContextSnapshot.app before capturing")
             }
             let target = try foregroundTarget()
-            let text = collectWindowText(target.accessibilityWindow)
+            let accessible = collectWindowText(target.accessibilityWindow, pid: target.app.processIdentifier)
+            try validateCaptureTarget(target)
             Task { @MainActor in
                 defer { self.capturing = false }
                 do {
                     let appIcon = appIconPNGBase64(target.app.icon)
                     let image = try await screenshot(target)
+                    let imageCapturedAt = captureTimestamp()
+                    try validateCaptureTarget(target)
                     let data = try pngData(image)
                     var capture: [String: Any] = ["pngBase64": data.base64EncodedString(), "title": String(target.title.prefix(1024)),
                         "appName": String((target.app.localizedName ?? "").prefix(256)),
                         "bundleId": String((target.app.bundleIdentifier ?? "").prefix(256)),
                         "pid": target.app.processIdentifier, "width": image.width, "height": image.height,
-                        "text": text, "capturedAt": ISO8601DateFormatter().string(from: Date())]
+                        "text": accessible.text, "capturedAt": imageCapturedAt,
+                        "captureQuality": accessible.quality, "source": accessible.source,
+                        "timing": ["imageCapturedAt": imageCapturedAt,
+                            "textStartedAt": accessible.startedAt, "textFinishedAt": accessible.finishedAt]]
                     if let appIcon { capture["appIconPngBase64"] = appIcon }
                     self.writer.send(["type": "capture", "captureId": id, "capture": capture])
                 } catch { self.sendError(id: id, error: error) }
@@ -722,6 +1067,10 @@ private final class SnapshotHelper: @unchecked Sendable {
     }
 
     private func shutdown() {
+        recorder.end(clearToken: true)
+        recordingWindow = nil
+        recorderTimer?.invalidate()
+        if let focusObserver { NSWorkspace.shared.notificationCenter.removeObserver(focusObserver) }
         if let tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
         if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
         exit(0)
@@ -744,7 +1093,10 @@ private func runSelfTest() throws {
                    "Default Double Command chord failed")
     }
     try verify(ShortcutConfiguration.parse(["version": 1, "codes": ["MetaLeft", "KeyS"]]) != nil
-        && ShortcutConfiguration.parse(["version": 1, "codes": ["F8", "F9", "F10", "F11"]]) != nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["F8", "F9"]]) != nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["F8", "F9", "F10"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["F8", "F9", "F10", "F11"]]) == nil
+        && ShortcutConfiguration.parse(["version": 1, "codes": ["KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI"]]) == nil
         && ShortcutConfiguration.parse(["version": 1, "codes": ["KeyA"]]) == nil
         && ShortcutConfiguration.parse(["version": 1, "codes": ["KeyA", "KeyA"]]) == nil
         && ShortcutConfiguration.parse(["version": 2, "codes": ["MetaLeft", "KeyS"]]) == nil
@@ -755,20 +1107,19 @@ private func runSelfTest() throws {
         && supportedCodes.count == physicalCodes.count && modifierCodes.isSubset(of: supportedCodes),
         "Shortcut validation or physical code mapping failed")
 
-    chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "ShiftRight", "KeyS"]))
+    chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "KeyS"]))
     try verify(!chord.update(code: "KeyS", down: true, modifiers: []), "Early key fired")
-    try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Incomplete chord fired")
-    try verify(chord.update(code: nil, down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+    try verify(chord.update(code: nil, down: false, modifiers: ["MetaLeft"]),
                "Mixed chord or reverse press order failed")
-    try verify(!chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft", "ShiftRight"], repeated: true),
+    try verify(!chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft"], repeated: true),
                "Auto repeat fired")
-    try verify(!chord.update(code: "KeyA", down: true, modifiers: ["MetaLeft", "ShiftRight"]),
+    try verify(!chord.update(code: "KeyA", down: true, modifiers: ["MetaLeft"]),
                "Extra ordinary key fired")
-    try verify(!chord.update(code: "KeyA", down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+    try verify(!chord.update(code: "KeyA", down: false, modifiers: ["MetaLeft"]),
                "Unrelated key release rearmed the chord")
-    try verify(!chord.update(code: "KeyS", down: false, modifiers: ["MetaLeft", "ShiftRight"]),
+    try verify(!chord.update(code: "KeyS", down: false, modifiers: ["MetaLeft"]),
                "Bound key release fired")
-    try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft", "ShiftRight"]),
+    try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft"]),
                "Bound key release did not rearm")
 
     chord.configure(ShortcutConfiguration(codes: ["F8", "F9"]))
@@ -786,12 +1137,6 @@ private func runSelfTest() throws {
     try verify(!chord.update(code: "F9", down: false, modifiers: []), "Blocked pair release fired")
     try verify(!chord.update(code: "F9", down: true, modifiers: []), "Ordinary pair fired early")
     try verify(chord.update(code: "F8", down: true, modifiers: []), "Recording resume failed to rearm")
-    chord.configure(ShortcutConfiguration(codes: ["F8", "F9", "F10", "F11"]))
-    for code in ["F8", "F9", "F10"] {
-        try verify(!chord.update(code: code, down: true, modifiers: []), "Four-key chord fired early")
-    }
-    try verify(chord.update(code: "F11", down: true, modifiers: []), "Four-key chord failed")
-
     chord.configure(ShortcutConfiguration(codes: ["MetaLeft", "KeyS"]))
     try verify(!chord.update(code: nil, down: false, modifiers: ["MetaLeft"]), "Modifier fired early")
     try verify(chord.update(code: "KeyS", down: true, modifiers: ["MetaLeft"]), "Command-letter chord failed")
@@ -825,6 +1170,131 @@ private func runSelfTest() throws {
           boundedText(["text"], maximum: 0).isEmpty else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "UTF-16 limit, newline budget or grapheme boundary failed")
     }
+    var qualityFixture = AccessibleCapture()
+    qualityFixture.text = "AXButton: Save"
+    try verify(qualityFixture.quality["status"] as? String == "available", "Successful AX capture was misclassified")
+    qualityFixture.reasons = ["text_budget_reached", "field_truncated"]
+    try verify(qualityFixture.quality["status"] as? String == "partial"
+        && qualityFixture.quality["reasons"] as? [String] == ["field_truncated", "text_budget_reached"],
+        "Partial quality reasons must remain factual and stable")
+    qualityFixture.text = ""
+    try verify(qualityFixture.quality["status"] as? String == "image_only", "Empty AX capture was not image-only")
+    try verify(nodePriority(role: "AXToolbar", subrole: nil, focusedPath: true) == 0
+        && nodePriority(role: "AXRow", subrole: nil, focusedPath: false, selected: true) == 1
+        && nodePriority(role: "AXGroup", subrole: "AXDialog", focusedPath: false) == 2
+        && nodePriority(role: "AXWebArea", subrole: nil, focusedPath: false) == 3
+        && nodePriority(role: "AXToolbar", subrole: nil, focusedPath: false) == 4,
+        "Focus, selection, dialog and document priority failed")
+    // Identity-only AX references exercise scheduling without reading any app.
+    let rootedFocusFixture = AXUIElementCreateApplication(123_451)
+    let siblingFixture = AXUIElementCreateApplication(123_452)
+    try verify(additionalRootedFocusChild(rootedFocusFixture, enumeratedChildren: nil)
+        .map { CFEqual($0, rootedFocusFixture) } == true
+        && additionalRootedFocusChild(rootedFocusFixture, enumeratedChildren: [])
+        .map { CFEqual($0, rootedFocusFixture) } == true
+        && additionalRootedFocusChild(rootedFocusFixture, enumeratedChildren: [siblingFixture])
+        .map { CFEqual($0, rootedFocusFixture) } == true,
+        "A verified focus route must survive failed, empty or bounded child enumeration")
+    try verify(additionalRootedFocusChild(rootedFocusFixture,
+        enumeratedChildren: [siblingFixture, rootedFocusFixture]) == nil
+        && additionalRootedFocusChild(nil, enumeratedChildren: nil) == nil,
+        "Focus scheduling must neither duplicate an enumerated child nor invent an unverified route")
+    try verify(verifiedSourceURL("https://example.com/path?selected=1" as CFString) == "https://example.com/path?selected=1"
+        && verifiedSourceURL("example.com/from-title" as CFString) == nil
+        && verifiedSourceURL("javascript:alert(1)" as CFString) == nil,
+        "Source URLs must be explicit absolute document URLs")
+    let captureClock = ISO8601DateFormatter()
+    captureClock.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    try verify(captureClock.date(from: captureTimestamp()) != nil, "Capture timestamps must carry milliseconds and timezone")
+    func recordingWindowRow(pid: Int, id: Int, layer: Int = 0, alpha: Double = 1) -> [String: Any] {
+        [kCGWindowOwnerPID as String: NSNumber(value: pid), kCGWindowNumber as String: NSNumber(value: id),
+         kCGWindowLayer as String: NSNumber(value: layer), kCGWindowAlpha as String: NSNumber(value: alpha),
+         kCGWindowBounds as String: CGRect(x: 10, y: 10, width: 600, height: 400).dictionaryRepresentation,
+         kCGWindowName as String: "An irrelevant mutable title"]
+    }
+    let recordingIdentity = RecordingWindowIdentity(pid: 321, id: 20)
+    try verify(frontRecordingWindow(pid: 321, rows: [recordingWindowRow(pid: 111, id: 10),
+        recordingWindowRow(pid: 321, id: 11, layer: 1), recordingWindowRow(pid: 321, id: 12, alpha: 0),
+        recordingWindowRow(pid: 321, id: 20), recordingWindowRow(pid: 321, id: 21)]) == recordingIdentity,
+        "Recorder window binding must use the front visible standard window of its exact owner")
+    try verify(frontRecordingWindow(pid: 321, rows: []) == nil
+        && recordingIdentity != RecordingWindowIdentity(pid: 321, id: 21)
+        && recordingIdentity != RecordingWindowIdentity(pid: 322, id: 20),
+        "Unknown windows, other windows of Harness, and recycled IDs with another owner must not match")
+    var recorder = PhysicalShortcutRecorder()
+    try verify(!recorder.active, "Capture pause must not implicitly start a key recorder")
+    try recorder.begin(token: "recording-test-token-1", now: 1, focused: true, held: [])
+    let recordedKeys = ["ControlLeft", "ShiftRight"]
+    for code in recordedKeys { recorder.update(code: code, down: true, now: 2, focused: true) }
+    try verify(recorder.object["current"] as? [String] == recordedKeys.sorted()
+        && recorder.object["peak"] as? [String] == recordedKeys.sorted(), "Two physical recorder keys or sides were lost")
+    recorder.update(code: "ShiftRight", down: true, now: 2, focused: true)
+    recorder.update(code: "ControlLeft", down: false, now: 3, focused: true)
+    try verify(recorder.state == "holding", "A first release must not complete before all releases")
+    recorder.update(code: "KeyC", down: true, now: 3, focused: true)
+    try verify(recorder.object["peak"] as? [String] == recordedKeys.sorted()
+        && !recorder.tracked.contains("KeyC"), "A post-release key forged a never-simultaneous chord")
+    for code in recordedKeys { recorder.update(code: code, down: false, now: 4, focused: true) }
+    recorder.check(now: 50, focused: true)
+    try verify(recorder.state == "complete" && recorder.tracked.isEmpty
+        && recorder.object["peak"] as? [String] == recordedKeys.sorted(), "Completed candidates must remain reviewable after the acquisition deadline")
+    recorder.check(now: 51, focused: false)
+    recorder.update(code: "KeyC", down: true, now: 52, focused: true)
+    try verify(!recorder.active && recorder.state == "complete"
+        && recorder.object["peak"] as? [String] == recordedKeys.sorted(), "A completed candidate must survive later focus changes and ignore new key events")
+    recorder.end()
+    try verify(!recorder.active && recorder.object["peak"] as? [String] == [], "Ended recorder retained physical keys")
+    func rejectsRecording(_ code: String, _ action: () throws -> Void) throws {
+        do { try action(); throw CaptureFailure(code: "SELF_TEST_FAILED", message: "Invalid recorder operation was accepted") }
+        catch let failure as CaptureFailure { try verify(failure.code == code, "Recorder error classification failed") }
+    }
+    try rejectsRecording("INVALID_RECORDING_TOKEN") { try recorder.require("other-recording-token") }
+    try rejectsRecording("KEYS_ALREADY_HELD") { try recorder.begin(token: "recording-test-token-2", now: 60, focused: true, held: ["KeyA"]) }
+    try rejectsRecording("RECORDING_NOT_FOCUSED") { try recorder.begin(token: "recording-test-token-2", now: 60, focused: false, held: []) }
+    try recorder.begin(token: "recording-test-token-2", now: 60, focused: true, held: [])
+    try rejectsRecording("INVALID_RECORDING_TOKEN") { try recorder.begin(token: "recording-test-token-2", now: 60, focused: true, held: []) }
+    recorder.update(code: "KeyA", down: true, now: 61, focused: true)
+    recorder.check(now: 75, focused: true)
+    try verify(recorder.state == "expired" && recorder.tracked.isEmpty
+        && recorder.object["peak"] as? [String] == [], "Unfinished recorder did not expire at 15 seconds")
+    try recorder.begin(token: "recording-test-token-3", now: 80, focused: true, held: [])
+    recorder.update(code: "KeyA", down: true, now: 81, focused: true)
+    recorder.check(now: 82, focused: false); recorder.check(now: 83, focused: true)
+    try verify(recorder.state == "interrupted" && recorder.tracked.isEmpty
+        && recorder.object["peak"] as? [String] == [], "Focus loss failed to clear and terminate the lease")
+    try recorder.begin(token: "recording-test-token-4", now: 90, focused: true, held: [])
+    recorder.update(code: "KeyA", down: true, now: 91, focused: true)
+    recorder.update(code: "KeyA", down: false, now: 92, focused: true)
+    try verify(recorder.state == "complete" && recorder.object["peak"] as? [String] == ["KeyA"], "Single-key completion must be explicit for UI rejection")
+    recorder.update(code: "KeyB", down: true, now: 93, focused: true)
+    try verify(recorder.object["peak"] as? [String] == ["KeyA"], "Two non-overlapping single-key gestures must not become a pair")
+    recorder.end(clearToken: true)
+    try rejectsRecording("INVALID_RECORDING_TOKEN") { try recorder.require("recording-test-token-4") }
+    try recorder.begin(token: "recording-test-token-5", now: 100, focused: true, held: [])
+    let manyKeys = ["KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI"]
+    for code in manyKeys.prefix(3) { recorder.update(code: code, down: true, now: 101, focused: true) }
+    try verify(recorder.state == "too_many" && recorder.tracked.isEmpty && recorder.object["peak"] as? [String] == [],
+        "The third simultaneous key must reject immediately, without silently clipping")
+    for code in manyKeys.dropFirst(3) { recorder.update(code: code, down: true, now: 101, focused: true) }
+    for code in manyKeys { recorder.update(code: code, down: false, now: 102, focused: true) }
+    try verify(recorder.state == "too_many" && !recorder.active && recorder.tracked.isEmpty
+        && recorder.object["peak"] as? [String] == [], "A third simultaneous key must terminate recording without retaining the first pair")
+    try recorder.require("recording-test-token-5")
+    recorder.check(now: 200, focused: false)
+    try verify(recorder.state == "too_many", "A rejected three-key recording must stay terminal until explicit cleanup")
+    recorder.end(); recorder.end()
+    try verify(recorder.state == "ended" && recorder.object["peak"] as? [String] == [], "Rejected chord cleanup must be idempotent")
+    try recorder.begin(token: "recording-test-token-6", now: 110, focused: true, held: [])
+    recorder.update(code: "unmapped-255", down: true, now: 111, focused: true)
+    try verify(recorder.state == "interrupted" && recorder.object["peak"] as? [String] == [], "Unsupported physical events must not manufacture an accepted chord")
+    try recorder.begin(token: "recording-test-token-7", now: 120, focused: true, held: [])
+    recorder.update(code: "KeyA", down: true, now: 121, focused: true)
+    recorder.check(now: 122, focused: recordingIdentity == RecordingWindowIdentity(pid: 321, id: 21))
+    try verify(recorder.state == "interrupted" && recorder.object["peak"] as? [String] == [], "Switching Harness windows must terminate unfinished recording")
+    try recorder.begin(token: "recording-test-token-8", now: 130, focused: true, held: [])
+    for code in ["KeyA", "KeyB"] { recorder.update(code: code, down: true, now: 131, focused: true) }
+    for code in ["KeyA", "KeyB"] { recorder.update(code: code, down: false, now: 132, focused: true) }
+    try verify(recorder.state == "complete" && recorder.object["peak"] as? [String] == ["KeyA", "KeyB"], "A pair of different ordinary physical keys must complete")
     let label = quotedAXText("共享按钮", maximum: 256)!
     let firstNode = accessibilityTreeLine(role: "AXButton", subrole: nil, depth: 1,
         states: [("enabled", "true"), ("focused", "false")], fields: [("Title", label)])
@@ -900,7 +1370,7 @@ private func runSelfTest() throws {
           appIconPNGBase64(NSImage(size: .zero)) == nil else {
         throw CaptureFailure(code: "SELF_TEST_FAILED", message: "App icon encoding, bounds or fallback failed")
     }
-    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "shortcut-validation-and-physical-codes", "mixed-chord-reverse-press-order", "exact-ordinary-and-modifier-chords", "recording-pause-and-held-key-blocking", "arbitrary-multi-key-chord", "command-missing-keyup-cleanup", "unmapped-extra-key-blocking", "unicode-text-limit", "utf16-emoji-limit", "utf16-grapheme-and-newline-boundaries", "ax-tree-hierarchy-and-repeated-controls", "ax-provider-states", "ax-selection-range", "ax-safe-scalars-and-string-bounds", "ax-password-hidden-and-failed-safety-exclusion", "png-encoding", "app-icon-png-bounds", "app-icon-transparent-padding", "app-icon-optional-fallback"]])
+    JSONWriter().send(["type": "self-test", "ok": true, "checks": ["dual-command-chord", "hold-no-repeat", "release-rearm", "shortcut-validation-and-physical-codes", "mixed-chord-reverse-press-order", "exact-ordinary-and-modifier-chords", "recording-pause-and-held-key-blocking", "exactly-two-key-configuration-and-oversize-rejection", "command-missing-keyup-cleanup", "unmapped-extra-key-blocking", "unicode-text-limit", "utf16-emoji-limit", "utf16-grapheme-and-newline-boundaries", "ax-tree-hierarchy-and-repeated-controls", "ax-provider-states", "ax-selection-range", "ax-safe-scalars-and-string-bounds", "ax-password-hidden-and-failed-safety-exclusion", "capture-quality-classification-and-reasons", "focus-dialog-document-priority", "rooted-focus-route-child-enumeration-fallback", "verified-document-source-url", "capture-clock-format", "two-key-recording-and-third-key-rejection", "recording-token-focus-expiry-and-cleanup", "recorder-window-identity-and-focus", "png-encoding", "app-icon-png-bounds", "app-icon-transparent-padding", "app-icon-optional-fallback"]])
 }
 
 if CommandLine.arguments.contains("--self-test") {

@@ -12,23 +12,27 @@ const bundle = await build({ entryPoints: [fileURLToPath(new URL('../src/Snapsho
 const module = { exports: {} };
 const windowListeners = new Map();
 const documentListeners = new Map();
+const recordingTimers = new Map();
+let nextRecordingTimer = 0;
 const browserDocument = { hidden: false, documentElement: { clientWidth: 1024 }, addEventListener: (name, callback) => documentListeners.set(name, callback), removeEventListener: name => documentListeners.delete(name) };
 runInNewContext(bundle.outputFiles[0].text, {
   module, exports: module.exports, require, console, queueMicrotask,
   window: { addEventListener: (name, callback) => windowListeners.set(name, callback), removeEventListener: name => windowListeners.delete(name) },
   document: browserDocument,
+  setTimeout(callback) { const id = ++nextRecordingTimer; recordingTimers.set(id, callback); return id; },
+  clearTimeout(id) { recordingTimers.delete(id); },
 });
 const { SnapshotPopover } = module.exports;
 const shortcut = codes => ({ version: 1, codes });
 
 async function fixture(overrides = {}) {
-  const recordings = [], saved = [], closedWith = [];
+  const recordings = [], saved = [], savedAuthorizations = [], closedWith = [];
   let closed = 0;
   const props = {
     status: { ready: true, shortcut: shortcut(['MetaLeft', 'MetaRight']) }, pending: null, isWindows: false,
     onPermissions() {}, onRestart() {}, onClose(restoreFocus) { closed += 1; closedWith.push(restoreFocus); },
     onRecordingChange: async value => { recordings.push(value); },
-    onShortcutChange: async value => { saved.push(value); },
+    onShortcutChange: async (value, authorization) => { saved.push(value); savedAuthorizations.push(authorization); },
     checkShortcut: () => ({ conflicts: [] }),
     ...overrides,
   };
@@ -43,10 +47,38 @@ async function fixture(overrides = {}) {
     await act(async () => { view.root.findByProps({ role: 'dialog' }).props[up ? 'onKeyUp' : 'onKeyDown'](event); });
     return { prevented, stopped };
   };
-  const chord = async codes => { for (const code of codes) await key(code); await key(codes[0], true); };
+  const windowKey = async (code, up = false, extra = {}) => {
+    let prevented = false, stopped = false;
+    const event = { code, repeat: false, preventDefault() { prevented = true; }, stopPropagation() { stopped = true; }, ...extra };
+    const handler = windowListeners.get(up ? 'keyup' : 'keydown');
+    await act(async () => { handler?.(event); });
+    return { prevented, stopped };
+  };
+  const chord = async codes => { for (const code of codes) await key(code); for (const code of [...codes].reverse()) await key(code, true); };
   const dispose = async () => { await act(async () => { view.unmount(); }); };
   const update = async next => { Object.assign(props, next); await act(async () => { view.update(React.createElement(SnapshotPopover, props)); }); };
-  return { view, text, button, click, key, chord, dispose, update, recordings, saved, closedWith, get closed() { return closed; } };
+  return { view, text, button, click, key, windowKey, chord, dispose, update, recordings, saved, savedAuthorizations, closedWith, get closed() { return closed; } };
+}
+
+const nativeToken = number => `10000000-0000-4000-8000-${String(number).padStart(12, '0')}`;
+const nativeCodes = ['MetaLeft', 'ControlLeft', 'ShiftLeft', 'AltRight', 'Escape', 'KeyJ', 'KeyK', 'KeyL'];
+const nativeFrame = (token, state = 'waiting', current = [], peak = []) => ({ token, state, current, peak });
+async function nativeFixture(overrides = {}) {
+  let state, begins = 0;
+  const recordings = [], ended = [];
+  const f = await fixture({ nativeRecording: true,
+    status: { ready: true, shortcut: shortcut(['MetaLeft', 'MetaRight']), supportedCodes: nativeCodes },
+    onRecordingChange: async active => { recordings.push(active); if (active) { state = nativeFrame(nativeToken(++begins)); return state; } },
+    onRecordingState: async () => state,
+    onRecordingEnd: async token => { ended.push(token); },
+    ...overrides,
+  });
+  const poll = async () => {
+    const [id, callback] = [...recordingTimers][0] ?? [];
+    assert.ok(callback, 'native recording poll is scheduled'); recordingTimers.delete(id);
+    await act(async () => { await callback(); });
+  };
+  return { ...f, poll, recordings, ended, setNative(value) { state = value; }, get token() { return state.token; }, get closed() { return f.closed; } };
 }
 
 async function outsideFixture(overrides = {}) {
@@ -71,11 +103,178 @@ test('popover waits for capture pause acknowledgement, records physical sides, a
   await f.key('KeyS');
   assert.equal(f.button('保存快捷键').props.disabled, true, 'still held: recording is incomplete');
   await f.key('KeyS', true);
+  assert.equal(f.button('保存快捷键').props.disabled, true, 'the modifier remains held');
+  await f.key('AltRight', true);
   assert.equal(f.button('保存快捷键').props.disabled, false);
   await f.click('保存快捷键');
   assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['AltRight', 'KeyS'])]);
   assert.deepEqual(recordings, [true, false]);
   assert.doesNotMatch(f.text(), /设置快捷键/);
+});
+
+test('window capture records exactly two physical keys before React bubbling and waits for complete release', async t => {
+  const f = await fixture();
+  t.after(f.dispose);
+  assert.equal(windowListeners.has('keydown'), false, 'idle panels do not intercept the window');
+  await f.click('修改快捷键');
+  for (const code of ['ControlLeft', 'KeyK']) {
+    assert.deepEqual(await f.windowKey(code), { prevented: true, stopped: true });
+  }
+  assert.match(f.text(), /left Ctrl/);
+  assert.match(f.text(), /"K"/);
+  await f.windowKey('KeyK', true);
+  assert.equal(f.button('保存快捷键').props.disabled, true, 'first release cannot confirm the held modifier');
+  await f.windowKey('ControlLeft', true);
+  assert.equal(f.button('保存快捷键').props.disabled, false);
+  assert.equal(windowListeners.has('keydown'), false, 'completed recording releases the capture listener');
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['ControlLeft', 'KeyK'])]);
+});
+
+test('a third simultaneously held key clears the entire DOM candidate and requires rerecording', async t => {
+  const f = await fixture();
+  t.after(f.dispose);
+  await f.click('修改快捷键');
+  const codes = ['AltRight', 'ShiftLeft', 'KeyJ', 'KeyK'];
+  for (const code of codes) await f.windowKey(code);
+  assert.match(f.text(), /只同时按住两个不同按键，重新录入/);
+  assert.doesNotMatch(f.text(), /left Option|left Shift|"J"|"K"/);
+  assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.equal(windowListeners.has('keydown'), false, 'oversized recording stops interception');
+  for (const code of codes) await f.windowKey(code, true);
+  assert.equal(f.button('保存快捷键').props.disabled, true, 'release cannot silently keep the first pair');
+  assert.deepEqual(f.saved, []);
+  await f.click('重新录入'); await f.chord(['KeyJ', 'KeyK']);
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['KeyJ', 'KeyK'])]);
+});
+
+test('partially overlapping presses do not union keys that were never held together', async t => {
+  const f = await fixture();
+  t.after(f.dispose);
+  await f.click('修改快捷键');
+  await f.windowKey('KeyJ');
+  await f.windowKey('KeyK');
+  await f.windowKey('KeyJ', true);
+  await f.windowKey('KeyL');
+  await f.windowKey('KeyK', true);
+  await f.windowKey('KeyL', true);
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['KeyJ', 'KeyK'])], 'the largest observed set is an actual simultaneous chord, not J+K+L');
+});
+
+test('real Desktop mode derives the two-key candidate exclusively from native state', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  await f.windowKey('MetaLeft'); // Deliberately omit its DOM keyup.
+  await f.windowKey('KeyL');
+  assert.doesNotMatch(f.text(), /"L"|left Command.*left Ctrl/);
+  const peak = ['ControlLeft', 'KeyK'];
+  f.setNative(nativeFrame(f.token, 'holding', peak, peak)); await f.poll();
+  await f.windowKey('ControlLeft', true); await f.windowKey('KeyK', true);
+  assert.equal(f.button('保存快捷键').props.disabled, true, 'DOM releases never confirm the native candidate');
+  f.setNative(nativeFrame(f.token, 'complete', [], peak)); await f.poll();
+  assert.equal(recordingTimers.size, 0, 'complete stops polling');
+  assert.equal(f.button('保存快捷键').props.disabled, false);
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(peak)]);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.savedAuthorizations)), [{ token: nativeToken(1), reset: false }]);
+  assert.deepEqual(f.recordings, [true, false]);
+});
+
+test('native too_many rejects the full gesture, ends its token and never saves a truncated pair', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  f.setNative(nativeFrame(f.token, 'holding', ['ControlLeft', 'KeyK'], ['ControlLeft', 'KeyK'])); await f.poll();
+  f.setNative(nativeFrame(f.token, 'too_many')); await f.poll();
+  assert.match(f.text(), /只同时按住两个不同按键，重新录入/);
+  assert.doesNotMatch(f.text(), /left Ctrl|"K"/);
+  assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.equal(recordingTimers.size, 0);
+  assert.deepEqual(f.ended, [nativeToken(1)]);
+  assert.deepEqual(f.saved, []);
+  await f.click('重新录入'); assert.equal(f.token, nativeToken(2));
+  f.setNative(nativeFrame(f.token, 'complete', [], ['KeyJ', 'KeyK'])); await f.poll();
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['KeyJ', 'KeyK'])]);
+});
+
+test('blur before the next poll retains an explicit native third-key rejection', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  f.setNative(nativeFrame(f.token, 'too_many'));
+  await act(async () => { windowListeners.get('blur')(); });
+  assert.match(f.text(), /只同时按住两个不同按键，重新录入/);
+  assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.deepEqual(f.ended, [nativeToken(1)]);
+  assert.deepEqual(f.saved, []);
+});
+
+test('native single keys and expired gestures are cleared or rejected, with fresh identity on rerecord', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  f.setNative(nativeFrame(f.token, 'complete', [], ['KeyJ'])); await f.poll();
+  assert.match(f.text(), /单键不能保存/); assert.equal(f.button('保存快捷键').props.disabled, true);
+  await f.click('重新录入'); assert.equal(f.token, nativeToken(2));
+  f.setNative(nativeFrame(f.token, 'holding', ['KeyJ', 'KeyK'], ['KeyJ', 'KeyK'])); await f.poll();
+  f.setNative(nativeFrame(f.token, 'expired')); await f.poll();
+  assert.match(f.text(), /录入已超时/); assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.doesNotMatch(f.text(), /"J"|"K"/);
+  assert.deepEqual(f.ended, [nativeToken(2)], 'expired native collection is explicitly ended without resuming capture');
+  await f.click('重新录入'); assert.equal(f.token, nativeToken(3));
+});
+
+test('native Ctrl+Escape is not mistaken for standalone Escape when DOM modifier down is absent', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  await f.windowKey('Escape', false, { ctrlKey: true });
+  assert.equal(f.closed, 0); assert.deepEqual(f.recordings, [true]);
+  f.setNative(nativeFrame(f.token, 'complete', [], ['ControlLeft', 'Escape'])); await f.poll();
+  assert.equal(f.button('保存快捷键').props.disabled, false);
+});
+
+test('release followed by blur confirms native completion even when the last normal poll is delayed', async t => {
+  let state = nativeFrame(nativeToken(1)), delayed, reads = 0;
+  const f = await nativeFixture({
+    onRecordingChange: async active => active ? state : undefined,
+    onRecordingState: async () => ++reads === 2 ? new Promise(resolve => { delayed = resolve; }) : state,
+  }); t.after(f.dispose);
+  await f.click('修改快捷键');
+  const [id, callback] = [...recordingTimers][0]; recordingTimers.delete(id);
+  await act(async () => { void callback(); });
+  state = nativeFrame(nativeToken(1), 'complete', [], ['ControlLeft', 'KeyK']);
+  await act(async () => { windowListeners.get('blur')(); });
+  assert.equal(f.button('保存快捷键').props.disabled, false, 'one confirmed native read preserves the completed chord');
+  await act(async () => { delayed(nativeFrame(nativeToken(1), 'holding', ['KeyK'], ['ControlLeft', 'KeyK'])); });
+  assert.equal(f.button('保存快捷键').props.disabled, false, 'the superseded poll cannot overwrite the completed result');
+  await f.click('保存快捷键');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved)), [shortcut(['ControlLeft', 'KeyK'])]);
+});
+
+test('a late native result cannot overwrite a new recording token', async t => {
+  let state, count = 0, delayed, reads = 0;
+  const f = await nativeFixture({
+    onRecordingChange: async active => { if (active) { state = nativeFrame(nativeToken(++count)); return state; } },
+    onRecordingState: async () => ++reads === 2 ? new Promise(resolve => { delayed = resolve; }) : state,
+  }); t.after(f.dispose);
+  await f.click('修改快捷键');
+  const [id, callback] = [...recordingTimers][0]; recordingTimers.delete(id);
+  await act(async () => { void callback(); });
+  await f.click('重新录入');
+  await act(async () => { delayed(nativeFrame(nativeToken(1), 'complete', [], ['KeyJ', 'KeyK'])); });
+  assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.match(f.text(), /请同时按住两个不同键/);
+});
+
+test('blur of an unfinished native gesture ends its token and requires rerecording', async t => {
+  const f = await nativeFixture(); t.after(f.dispose);
+  await f.click('修改快捷键');
+  f.setNative(nativeFrame(f.token, 'holding', ['KeyJ', 'KeyK'], ['KeyJ', 'KeyK'])); await f.poll();
+  f.setNative(nativeFrame(f.token, 'interrupted'));
+  await act(async () => { windowListeners.get('blur')(); });
+  assert.match(f.text(), /录入已中断/); assert.equal(f.button('保存快捷键').props.disabled, true);
+  assert.deepEqual(f.ended, [nativeToken(1)]);
+  assert.deepEqual(f.recordings, [true], 'the product capture remains paused while the editor is open');
 });
 
 test('single and sequential keys cannot be saved; repeat never adds a second key', async t => {
@@ -89,10 +288,10 @@ test('single and sequential keys cannot be saved; repeat never adds a second key
   await f.key('F9');
   await f.key('F9', true);
   assert.equal(f.button('保存快捷键').props.disabled, true);
-  assert.match(f.text(), /单键不能保存|至少两个/);
+  assert.match(f.text(), /单键不能保存/);
   assert.equal(f.saved.length, 0);
-  await f.chord(['F8', 'F9', 'F10']);
-  assert.equal(f.button('保存快捷键').props.disabled, false, 'three simultaneously held keys remain supported');
+  await f.chord(['F8', 'F9']);
+  assert.equal(f.button('保存快捷键').props.disabled, false, 'exactly two simultaneously held keys can be saved');
 });
 
 test('a rejected pause cannot start recording or apply a default shortcut', async t => {

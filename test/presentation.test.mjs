@@ -365,6 +365,68 @@ for (const mode of ['pending', 'steering']) test(`official ${mode} preview revea
   assert.doesNotMatch(JSON.stringify(f.view.toJSON()), /window_snapshot|PRIVATE AX CONTEXT/);
 });
 
+for (const mode of ['history', 'pending', 'steering']) test(`official ${mode} recognizes a Swift uppercase UUID with millisecond capture time`, async t => {
+  const value = { appName: 'Google Chrome', title: '公开快照验证页', text: 'PUBLIC SNAPSHOT CHECK\nbutton Verify',
+    capturedAt: '2026-10-09T11:02:19.777Z', snapshotId: 'BA57E563-9FFE-42F5-89D9-9C8F59AB48B5',
+    captureQuality: { status: 'partial', reasons: ['provider_read_failed'], textSource: 'ax', nodeCount: 7 }, source: {},
+    timing: { imageCapturedAt: '2026-10-09T11:02:19.777Z', textStartedAt: '2026-10-09T11:02:19.778Z', textFinishedAt: '2026-10-09T11:02:19.780Z' },
+  };
+  const name = 'window-snapshot-BA57E563-9FFE-42F5-89D9-9C8F59AB48B5-2026-10-09T11-02-19-777Z.png';
+  const originalImage = { type: 'image', attachment: { ...durableImage.attachment, attachmentId: 'public-swift-capture', name } };
+  const submittedText = `验证公开测试页快照${contextText(value)}`;
+  const messageContent = [originalImage, { type: 'text', text: submittedText }];
+  const pendingSubmission = { ...pending, text: submittedText, attachments: [{ type: 'image', value: { previewUrl: 'blob:public-swift-capture', name, width: 1, height: 1 } }] };
+  const f = fixture({ mode, messageContent, pendingSubmission });
+  let stop;
+  t.after(async () => { stop?.(); await f.dispose(); });
+  assert.match(await f.render(), /window_snapshot/, 'the original official component displays the serialized context');
+  stop = installSnapshotPresentation(f.ctx);
+  const markup = await f.render();
+  assert.doesNotMatch(markup, /window_snapshot|PUBLIC SNAPSHOT CHECK|provider_read_failed/);
+  assert.match(markup, /data-snapshot-message-card/);
+  assert.match(markup, /公开快照验证页/);
+  assert.match(markup, /文字部分获取/);
+  await click(previewButton(f.view)); await click(button(f.view, '查看文本'));
+  const details = dialog(f.view).findByType('pre').children.join('');
+  assert.match(details, /PUBLIC SNAPSHOT CHECK/);
+  assert.match(details, /2026-10-09T11:02:19\.777Z/);
+  assert.equal(f.content, messageContent);
+  assert.equal(f.content[0], originalImage);
+  assert.equal(f.content.at(-1).text, submittedText, 'the stored model context stays unchanged');
+  if (mode === 'history') {
+    await click(button(f.view, '关闭快照预览')); await click(button(f.view, 'copy'));
+    assert.equal(copiedTexts.at(-1), '验证公开测试页快照');
+  }
+});
+
+for (const mode of ['history', 'pending', 'steering']) test(`official ${mode} v3 preview retains source, partial status and capture timing`, async t => {
+  const value = { ...capture,
+    captureQuality: { status: 'partial', reasons: ['time_budget_reached'], textSource: 'ax', nodeCount: 25, scope: 'ax_visible_children_when_available' },
+    source: { url: 'https://example.test/build', selectedText: 'Selected failure', focusedRole: 'button', focusedName: 'Retry' },
+    timing: { imageCapturedAt: capture.capturedAt, textStartedAt: '2026-10-08T09:13:36Z', textFinishedAt: capture.capturedAt },
+  };
+  const submittedText = `User body${contextText(value)}`;
+  const messageContent = [durableImage, { type: 'text', text: submittedText }];
+  const pendingSubmission = { ...pending, text: submittedText };
+  const f = fixture({ mode, messageContent, pendingSubmission });
+  const stop = installSnapshotPresentation(f.ctx);
+  t.after(async () => { stop(); await f.dispose(); });
+  const markup = await f.render();
+  assert.match(markup, /文字部分获取/);
+  assert.doesNotMatch(markup, /window_snapshot|PRIVATE AX CONTEXT|Selected failure|example\.test/);
+  await click(previewButton(f.view));
+  await click(button(f.view, '查看文本'));
+  const details = dialog(f.view).findByType('pre').children.join('');
+  assert.match(details, /URL: https:\/\/example.test\/build/);
+  assert.match(details, /选中文字：Selected failure/);
+  assert.match(details, /聚焦控件：button · Retry/);
+  assert.match(details, /控件遍历达到时间上限/);
+  assert.match(details, /文字采集：2026-10-08T09:13:36Z → 2026-10-08T09:13:37.889Z/);
+  assert.match(details, /优先使用可见控件列表/);
+  assert.doesNotMatch(outsidePreviewMarkup(f.view), /PRIVATE AX CONTEXT|Selected failure|example\.test/);
+  assert.equal(messageContent.at(-1).text, submittedText);
+});
+
 test('multiple official history snapshots navigate, close with Escape and reopen in image mode', async t => {
   const secondCapture = { ...capture, title: 'Second page', text: 'SECOND SAVED AX', snapshotId: '22345678-1234-4234-8234-123456789abc' };
   const secondFilename = `window-snapshot-${secondCapture.snapshotId}-${secondCapture.capturedAt.replace(/[^0-9TZ]/g, '-')}.png`;
@@ -415,7 +477,7 @@ test('a late authorized image from the previous snapshot cannot replace the acti
   assert.equal(dialog(f.view).findByType('img').props.alt, 'Google Chrome：Next page');
 });
 
-test('legacy snapshots without AX show image preview without a text toggle', async t => {
+test('legacy snapshots without AX keep their saved source and time accessible in text preview', async t => {
   const legacyCapture = { ...capture, text: '', snapshotId: undefined, appIconPngBase64: undefined };
   const legacyFilename = `window-snapshot-${legacyCapture.capturedAt.replace(/[^0-9TZ]/g, '-')}.png`;
   const legacyImage = { type: 'image', attachment: { ...durableImage.attachment, name: legacyFilename } };
@@ -426,8 +488,12 @@ test('legacy snapshots without AX show image preview without a text toggle', asy
   await f.render();
   await click(previewButton(f.view));
   assert.equal(dialog(f.view).findByType('img').props.src, 'blob:loaded');
-  assert.equal(dialog(f.view).findAll(node => node.type === 'button' && node.children.includes('查看文本')).length, 0);
+  assert.equal(dialog(f.view).findAll(node => node.type === 'button' && node.children.includes('查看文本')).length, 1);
   assert.equal(dialog(f.view).findAllByType('pre').length, 0);
+  await click(button(f.view, '查看文本'));
+  assert.match(dialog(f.view).findByType('pre').children.join(''), /Window: "Example page", App: Google Chrome/);
+  assert.match(dialog(f.view).findByType('pre').children.join(''), /Captured: 2026-10-08T09:13:37.889Z/);
+  assert.match(dialog(f.view).findByType('pre').children.join(''), /此窗口未提供可访问文本/);
   assert.doesNotMatch(outsidePreviewMarkup(f.view), /window_snapshot|此窗口未提供可访问文本/);
 });
 

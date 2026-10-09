@@ -50,6 +50,21 @@ test('stdin EPIPE rejects outstanding requests without an unhandled stream error
   native.dispose();
 });
 
+test('native request errors preserve a bounded protocol code for safe retry decisions', async () => {
+  const child = childFixture(); let attempt = 0;
+  child.stdin.on('data', chunk => {
+    const request = JSON.parse(chunk.toString());
+    if (request.method === 'shutdown') return;
+    child.stdout.write(JSON.stringify({ type: 'result', id: request.id, ok: false, error: {
+      code: ++attempt === 1 ? 'KEYS_ALREADY_HELD' : 'KEYS_ALREADY_HELD\nunsafe', message: 'Release all keys',
+    } }) + '\n');
+  });
+  const native = new NativeBridge(new SnapshotBroker(), { helperPath: fileURLToPath(import.meta.url), spawn: () => child });
+  await assert.rejects(native.request('beginShortcutRecording'), error => error.code === 'KEYS_ALREADY_HELD' && error.message === 'Release all keys');
+  await assert.rejects(native.request('beginShortcutRecording'), error => error.code === undefined && error.message === 'Release all keys');
+  child.emit('close'); native.dispose();
+});
+
 test('concurrent starts prepare one cached helper and spawn only the cached path', async () => {
   const preparation = deferred(), broker = new SnapshotBroker(), child = childFixture();
   const commands = []; let prepares = 0;

@@ -81,7 +81,7 @@ internal static class ShortcutKeys
             if (!unique.Add(code)) throw new InvalidOperationException("Shortcut must use distinct physical keys.");
             keys.Add(code);
         }
-        if (keys.Count < 2) throw new InvalidOperationException("Shortcut requires at least two distinct physical keys.");
+        if (keys.Count != 2) throw new InvalidOperationException("Shortcut requires exactly two distinct physical keys.");
         return new ShortcutConfiguration(1, keys.ToArray());
     }
 }
@@ -99,6 +99,7 @@ internal sealed class ShortcutGesture
     {
         get { lock (sync) return new(configuration.Version, (string[])configuration.Codes.Clone()); }
     }
+    public bool Recording { get { lock (sync) return recording; } }
     public void Configure(JsonElement value)
     {
         // Validate before taking ownership: a rejected update keeps the old
@@ -155,12 +156,131 @@ internal static class TargetPolicy
     public static bool IsExcluded(string processName) => Excluded.Contains(Path.GetFileNameWithoutExtension(processName.Trim()));
 }
 
+internal sealed class ShortcutRecordingException(string code, string message) : InvalidOperationException(message)
+{ public string Code { get; } = code; }
+internal sealed record ShortcutRecordingState(string Token, string State, string[] Current, string[] Peak);
+
+internal readonly record struct ShortcutRecordingWindow(nint Handle, uint ProcessId)
+{
+    public bool Matches(nint handle, uint processId) => Handle != 0 && ProcessId != 0 && Handle == handle && ProcessId == processId;
+}
+
+/// A single short-lived physical chord, not a keyboard event log. This class
+/// owns no character data and keeps only the held set and its simultaneous peak.
+internal sealed class PhysicalShortcutRecorder
+{
+    private readonly object sync = new();
+    private readonly HashSet<string> current = new(StringComparer.Ordinal);
+    private HashSet<string> peak = new(StringComparer.Ordinal);
+    private string? token;
+    private string state = "ended";
+    private long deadline;
+    private bool released;
+    public bool Active { get { lock (sync) return token != null && state is "waiting" or "holding"; } }
+    private ShortcutRecordingState Snapshot() => new(token ?? "", state, current.Order(StringComparer.Ordinal).ToArray(), peak.Order(StringComparer.Ordinal).ToArray());
+    public ShortcutRecordingState Begin(string? value, long now, bool focused, IEnumerable<string> held)
+    {
+        lock (sync)
+        {
+            if (value == null || value.Length is < 16 or > 128 || value == token)
+                throw new ShortcutRecordingException("INVALID_RECORDING_TOKEN", "Recording requires a fresh short token.");
+            if (!focused) throw new ShortcutRecordingException("RECORDING_NOT_FOCUSED", "Keep DeepSeek Harness in the foreground while recording.");
+            if (held.Any()) throw new ShortcutRecordingException("KEYS_ALREADY_HELD", "Release every key before starting a new recording.");
+            token = value; state = "waiting"; current.Clear(); peak.Clear(); released = false; deadline = now + 15_000;
+            return Snapshot();
+        }
+    }
+    public void Check(long now, bool focused)
+    {
+        lock (sync)
+        {
+            if (!Active) return;
+            if (now >= deadline) { state = "expired"; current.Clear(); peak.Clear(); }
+            else if (!focused) { state = "interrupted"; current.Clear(); peak.Clear(); }
+        }
+    }
+    public void Update(string code, bool down, long now, bool focused)
+    {
+        lock (sync)
+        {
+            Check(now, focused);
+            if (state is not ("waiting" or "holding")) return;
+            if (!ShortcutKeys.SupportedCodes.Contains(code, StringComparer.Ordinal))
+            { state = "interrupted"; current.Clear(); peak.Clear(); return; }
+            if (down)
+            {
+                if (released) return;
+                if (!current.Contains(code) && current.Count == 2)
+                { state = "too_many"; current.Clear(); peak.Clear(); return; }
+                current.Add(code);
+                if (current.Count > peak.Count) peak = new(current, StringComparer.Ordinal);
+                state = "holding";
+            }
+            else if (current.Remove(code))
+            {
+                released = true;
+                if (current.Count == 0) state = "complete";
+            }
+        }
+    }
+    public ShortcutRecordingState Read(string? value, long now, bool focused)
+    {
+        lock (sync) { Require(value); Check(now, focused); return Snapshot(); }
+    }
+    public ShortcutRecordingState End(string? value)
+    {
+        lock (sync) { Require(value); Stop(); return Snapshot(); }
+    }
+    public void Stop(bool clearToken = false)
+    {
+        lock (sync) { state = "ended"; current.Clear(); peak.Clear(); released = false; if (clearToken) token = null; }
+    }
+    private void Require(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value != token)
+            throw new ShortcutRecordingException("INVALID_RECORDING_TOKEN", "This recording lease is no longer current.");
+    }
+}
+
 internal enum SnapshotToggleState { Off, On, Mixed }
 internal enum SnapshotExpandState { Collapsed, Expanded, Partial, Leaf }
 internal sealed record SnapshotRange(double Value, double Minimum, double Maximum);
 internal static class SnapshotPrivacy
 {
     public static bool CanRead(bool? password, bool? offscreen) => password is false && offscreen is false;
+}
+
+internal sealed record SnapshotCaptureQuality(string Status, string[] Reasons, string TextSource, int NodeCount,
+    string Scope = "uia_control_view_visible")
+{
+    internal static SnapshotCaptureQuality Create(string text, IEnumerable<string> reasons, int nodes)
+    {
+        var unique = reasons.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        return new(text.Length == 0 ? "image_only" : unique.Length == 0 ? "available" : "partial", unique, "uia", nodes);
+    }
+}
+
+internal sealed record SnapshotSource
+{
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? Url { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? SelectedText { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? FocusedRole { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? FocusedName { get; init; }
+
+    internal static string? VerifiedUrl(string? value) => value is { Length: <= 2048 } &&
+        Uri.TryCreate(value, UriKind.Absolute, out var url) && url.Scheme is "http" or "https" or "file" ? value : null;
+}
+
+internal sealed record SnapshotTiming(string ImageCapturedAt, string TextStartedAt, string TextFinishedAt);
+
+internal static class SnapshotPriority
+{
+    internal static int Rank(bool focusRoute, bool modalWindow, string? role, bool selected = false) =>
+        focusRoute ? 0 : selected ? 1 : modalWindow ? 2 : role == "Document" ? 3 : 4;
 }
 
 // Only admitted primitive fields enter the formatter; UIA objects and text ranges
@@ -191,14 +311,21 @@ internal sealed class SnapshotTextTree(int maxChars, int maxNodes, int maxDepth)
     private readonly StringBuilder output = new();
     private int nodes;
     public bool CanAppend => nodes < maxNodes && output.Length < maxChars;
+    public HashSet<string> Reasons { get; } = new(StringComparer.Ordinal);
 
     public bool Append(SnapshotNode node, int depth)
     {
-        if (!CanAppend || depth < 0 || depth > maxDepth) return false;
+        if (nodes >= maxNodes) { Reasons.Add("node_budget_reached"); return false; }
+        if (output.Length >= maxChars) { Reasons.Add("text_budget_reached"); return false; }
+        if (depth < 0 || depth > maxDepth) { Reasons.Add("depth_budget_reached"); return false; }
         nodes++;
+        if (node.Name?.Length > LabelChars || node.Role?.Length > LabelChars ||
+            new[] { node.Value, node.Help, node.Text, node.SelectedText }.Any(value => value?.Length > FieldChars))
+            Reasons.Add("field_truncated");
         var line = Format(node, depth);
         if (output.Length != 0) output.Append('\n');
         var remaining = Math.Max(0, maxChars - output.Length);
+        if (line.Length > remaining) Reasons.Add("text_budget_reached");
         output.Append(Bound(line, remaining));
         return true;
     }
@@ -256,7 +383,7 @@ internal sealed class SnapshotTextTree(int maxChars, int maxNodes, int maxDepth)
     }
 
     private static string Quote(string value, int limit) => JsonSerializer.Serialize(Bound(value, limit), StringOptions);
-    private static string Bound(string value, int limit)
+    internal static string Bound(string value, int limit)
     {
         var length = Math.Min(value.Length, limit);
         if (length > 0 && char.IsHighSurrogate(value[length - 1])) length--;

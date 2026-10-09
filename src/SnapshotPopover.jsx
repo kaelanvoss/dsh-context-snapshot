@@ -2,6 +2,8 @@ import React, { useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, 
 import { SnapshotIcon } from './SnapshotIcon.jsx';
 import { defaultShortcut, shortcutLabels, validateShortcut } from './shortcuts.mjs';
 import { installPopoverDismiss } from './popover-dismiss.mjs';
+import { validateNativeRecordingState } from './shortcut-native-state.mjs';
+import { watchNativeRecording } from './native-recording-poll.mjs';
 
 const foreground = 'var(--dsw-alias-label-primary, CanvasText)';
 const secondary = 'var(--dsw-alias-label-secondary, color-mix(in srgb, CanvasText 65%, transparent))';
@@ -25,7 +27,7 @@ function ActionIcon({ restart }) {
   </svg>;
 }
 
-export function SnapshotPopover({ status, pending, isWindows, onPermissions, onRestart, onClose, onShortcutChange, onRecordingChange, checkShortcut, triggerRef, dismissRef, recordingError = '' }) {
+export function SnapshotPopover({ status, pending, isWindows, onPermissions, onRestart, onClose, onShortcutChange, onRecordingChange, onRecordingState, onRecordingEnd, nativeRecording = false, checkShortcut, triggerRef, dismissRef, recordingError = '' }) {
   const panelRef = useRef();
   const recorderRef = useRef();
   const editButtonRef = useRef();
@@ -34,6 +36,13 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
   const operation = useRef(0);
   const recording = useRef(false);
   const recordingCallback = useRef(onRecordingChange);
+  const keyHandlers = useRef();
+  const nativeState = useRef(null);
+  const nativeCodes = useRef([]);
+  const nativeSupported = useRef(status.supportedCodes);
+  const nativePoll = useRef(onRecordingState);
+  const nativeEnd = useRef(onRecordingEnd);
+  const [nativeToken, setNativeToken] = useState(null);
   const held = useRef(new Set());
   const peak = useRef([]);
   const dismissCallback = useRef();
@@ -51,6 +60,9 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
   const platform = isWindows ? 'win32' : 'darwin';
   const currentShortcut = status.shortcut ?? defaultShortcut(platform);
   recordingCallback.current = onRecordingChange;
+  nativeSupported.current = status.supportedCodes;
+  nativePoll.current = onRecordingState;
+  nativeEnd.current = onRecordingEnd;
   dismissCallback.current = requestClose;
   useImperativeHandle(dismissRef, () => requestClose);
   useEffect(() => {
@@ -87,19 +99,58 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     setShortcutError(`录入连接已中断，请重新录入。${typeof recordingError === 'string' ? ` ${recordingError.slice(0, 120)}` : ''}`);
   }, [recordingError, editing]);
   useEffect(() => {
+    if (!nativeRecording || !capturing || !nativeToken) return;
+    const generation = operation.current;
+    return watchNativeRecording(token => nativePoll.current(token), nativeToken,
+      value => applyNativeState(value, nativeToken), failNativeRecording,
+      { isCurrent: () => mounted.current && operation.current === generation && nativeState.current?.token === nativeToken });
+  }, [nativeRecording, capturing, nativeToken]);
+  useEffect(() => {
     if (!capturing) return;
     recorderRef.current?.focus();
+    // Desktop command handlers and the composer can consume ordinary keys
+    // before a React bubble handler sees them. Own the recording at the
+    // window capture boundary, after both dispatchers have confirmed pause.
+    const keyDown = event => keyHandlers.current.down(event);
+    const keyUp = event => keyHandlers.current.up(event);
     const interrupt = () => {
+      if (nativeRecording) {
+        held.current.clear(); setCapturing(false);
+        const state = nativeState.current, generation = operation.current;
+        if (state?.state === 'complete') return;
+        setRecordingReady(false);
+        if (!state?.token) { failNativeRecording(new Error('录入已中断，请重新录入。')); return; }
+        // The final release may already have completed in native while its
+        // last poll is still in transit. Confirm that exact token once; a
+        // waiting/interrupted recorder never continues collecting here.
+        Promise.resolve().then(() => nativePoll.current(state.token)).then(value => {
+          if (!mounted.current || operation.current !== generation || nativeState.current?.token !== state.token) return;
+          const confirmed = validateNativeRecordingState(value, state.token, nativeCodes.current);
+          if (['too_many', 'interrupted', 'expired', 'ended'].includes(confirmed.state)) { applyNativeState(confirmed, state.token); return; }
+          if (confirmed.state !== 'complete') { failNativeRecording(new Error('录入已中断，请重新录入。')); return; }
+          applyNativeState(confirmed, state.token); setRecordingReady(true);
+        }, error => {
+          if (mounted.current && operation.current === generation && nativeState.current?.token === state.token) failNativeRecording(error);
+        }).catch(error => {
+          if (mounted.current && operation.current === generation && nativeState.current?.token === state.token) failNativeRecording(error);
+        });
+        return;
+      }
       held.current.clear();
       peak.current = [];
       setCapturing(false);
       setCandidate({ version: 1, codes: [] });
+      if (nativeRecording) setRecordingReady(false);
       setShortcutError('录入已中断，请重新录入。');
     };
     const visibility = () => { if (document.hidden) interrupt(); };
+    window.addEventListener('keydown', keyDown, true);
+    window.addEventListener('keyup', keyUp, true);
     window.addEventListener('blur', interrupt);
     document.addEventListener('visibilitychange', visibility);
     return () => {
+      window.removeEventListener('keydown', keyDown, true);
+      window.removeEventListener('keyup', keyUp, true);
       window.removeEventListener('blur', interrupt);
       document.removeEventListener('visibilitychange', visibility);
     };
@@ -137,6 +188,29 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
       onClose(restoreFocus);
     }
   }
+  function failNativeRecording(error) {
+    const token = nativeState.current?.token, generation = operation.current;
+    held.current.clear(); peak.current = []; nativeState.current = null;
+    setNativeToken(null); setCapturing(false); setRecordingReady(false);
+    setCandidate({ version: 1, codes: [] });
+    setShortcutError(error.message || '原生录入已中断，请重新录入。');
+    if (token && nativeEnd.current) Promise.resolve().then(() => nativeEnd.current(token)).catch(failure => {
+      if (mounted.current && operation.current === generation && !nativeState.current) setShortcutError(`原生录入结束未确认，请重新录入或重启采集。${failure.message ? ` ${failure.message}` : ''}`);
+    });
+  }
+  function applyNativeState(value, token) {
+    const state = validateNativeRecordingState(value, token, nativeCodes.current);
+    nativeState.current = state;
+    if (['too_many', 'interrupted', 'expired', 'ended'].includes(state.state)) {
+      failNativeRecording(new Error(state.state === 'too_many' ? '请只同时按住两个不同按键，重新录入。' : state.state === 'expired' ? '录入已超时，请重新录入。' : '录入已中断，请重新录入。'));
+      return;
+    }
+    setCandidate({ version: 1, codes: state.peak });
+    if (state.state === 'complete') {
+      held.current.clear(); setCapturing(false);
+      if (state.peak.length !== 2) setShortcutError('请同时按住两个不同的按键，单键不能保存。');
+    }
+  }
   async function beginRecording() {
     if (busy || pending) return;
     pendingClose.current = null;
@@ -144,6 +218,7 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     const token = ++operation.current;
     held.current.clear();
     peak.current = [];
+    nativeState.current = null; setNativeToken(null);
     setEditing(true);
     setCapturing(false);
     setRecordingReady(false);
@@ -154,10 +229,18 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     setBusy('recording');
     recording.current = true;
     try {
-      await onRecordingChange?.(true);
+      const confirmed = await onRecordingChange?.(true);
       if (mounted.current && token === operation.current) {
+        if (nativeRecording) {
+          if (typeof nativePoll.current !== 'function' || typeof nativeEnd.current !== 'function' || !Array.isArray(nativeSupported.current) || !nativeSupported.current.length) throw new Error('原生录入接口尚未就绪，请完整退出并重新打开 Harness。');
+          nativeCodes.current = [...nativeSupported.current];
+          const state = validateNativeRecordingState(confirmed, confirmed?.token, nativeCodes.current);
+          nativeState.current = state; setNativeToken(state.token);
+          applyNativeState(state, state.token);
+          if (!nativeState.current) return;
+        }
         setRecordingReady(true);
-        if (!pendingClose.current) setCapturing(true);
+        if (!pendingClose.current && (!nativeRecording || ['waiting', 'holding'].includes(nativeState.current.state))) setCapturing(true);
       }
     } catch (error) {
       if (mounted.current && token === operation.current) {
@@ -173,6 +256,7 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     const token = ++operation.current;
     held.current.clear();
     peak.current = [];
+    nativeState.current = null; setNativeToken(null);
     setCapturing(false);
     setBusy('finishing');
     try {
@@ -206,7 +290,7 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     try { return checkShortcut?.(shortcut) ?? { conflicts: [], limited: true, message: '当前无法查询 Harness 快捷键，仅检查按键格式。' }; }
     catch (error) { return { issue: error.message || '快捷键冲突检查失败。', conflicts: [] }; }
   }
-  async function saveShortcut(shortcut = candidate) {
+  async function saveShortcut(shortcut = candidate, reset = false) {
     if (busy || pending || !recordingReady || savedAwaitingResume || recordingError) return;
     const checked = inspect(shortcut);
     if (checked.issue || checked.conflicts?.length) {
@@ -221,7 +305,8 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     setBusy('saving');
     let saved = false;
     try {
-      await onShortcutChange(shortcut);
+      if (nativeRecording && !reset && nativeState.current?.state !== 'complete') throw new Error('原生录入尚未完整确认，请重新录入。');
+      await onShortcutChange(shortcut, nativeRecording ? { token: nativeToken, reset } : undefined);
       saved = true;
       if (mounted.current && token === operation.current) setSavedAwaitingResume(true);
       if (recording.current) await onRecordingChange?.(false);
@@ -237,6 +322,7 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
       if (mounted.current && token === operation.current) {
         closeBlocked.current = true;
         setReleaseFailed(saved);
+        if (nativeRecording && !saved) { nativeState.current = null; setNativeToken(null); setCandidate({ version: 1, codes: [] }); setRecordingReady(false); }
         setShortcutError(saved ? `快捷键已保存，但恢复监听失败，请重试。${error.message ? ` ${error.message}` : ''}` : error.message || '快捷键保存失败，请重试。');
       }
     } finally {
@@ -254,10 +340,24 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     }
     event.preventDefault();
     event.stopPropagation();
+    if (nativeRecording) {
+      // DOM events arbitrate Escape and prevent product shortcuts only. They
+      // never contribute a key to the native-authoritative candidate.
+      if (event.code === 'Escape' && held.current.size === 0 && !nativeState.current?.current.length && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) { void stopEditing(); return; }
+      if (!event.repeat && event.code) held.current.add(event.code);
+      return;
+    }
     if (event.code === 'Escape' && held.current.size === 0) { void stopEditing(); return; }
     if (event.repeat || !event.code) return;
     if (held.current.size === 0) { peak.current = []; setShortcutError(''); }
     held.current.add(event.code);
+    if (held.current.size > 2) {
+      held.current.clear(); peak.current = [];
+      setCapturing(false); setRecordingReady(false);
+      setCandidate({ version: 1, codes: [] });
+      setShortcutError('请只同时按住两个不同按键，重新录入。');
+      return;
+    }
     if (held.current.size > peak.current.length) {
       peak.current = Array.from(held.current);
       setCandidate({ version: 1, codes: peak.current });
@@ -267,20 +367,26 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     if (!capturing) return;
     event.preventDefault();
     event.stopPropagation();
+    if (nativeRecording) { held.current.delete(event.code); return; }
     if (!held.current.delete(event.code)) return;
-    if (peak.current.length >= 2) {
+    // A partial release must not finish the gesture: the remaining physical
+    // keys still belong to this recording. Keep the largest simultaneous set
+    // until every observed key is released; never join sequential presses.
+    if (held.current.size !== 0) return;
+    if (peak.current.length === 2) {
       setCandidate({ version: 1, codes: peak.current });
       held.current.clear();
       setCapturing(false);
-    } else if (held.current.size === 0) {
+    } else {
       peak.current = [];
-      setShortcutError('请同时按住至少两个键，单键不能保存。');
+      setShortcutError('请同时按住两个不同的按键，单键不能保存。');
     }
   }
+  keyHandlers.current = { down: captureKeyDown, up: captureKeyUp };
   const checked = inspect(editing ? candidate : currentShortcut);
   const candidateProblem = candidate.codes.length ? checked.issue : '';
   const conflictText = checked.conflicts?.length ? `与 Harness 快捷键冲突：${checked.conflicts.map(item => item.label || item.id).join('、')}` : '';
-  const canSave = editing && recordingReady && !recordingError && !savedAwaitingResume && !capturing && !busy && !pending && candidate.codes.length >= 2 && !checked.issue && !checked.conflicts?.length;
+  const canSave = editing && recordingReady && !recordingError && !savedAwaitingResume && !capturing && !busy && !pending && candidate.codes.length === 2 && !checked.issue && !checked.conflicts?.length;
   const ownedElsewhere = status.owner === false;
   const ready = status.ready === true;
   const paused = editing && recordingReady || status.recording === true;
@@ -311,14 +417,14 @@ export function SnapshotPopover({ status, pending, isWindows, onPermissions, onR
     {editing && <section aria-label="快捷键设置">
       <div style={{ fontWeight: 500, marginBottom: 10 }}>设置快捷键</div>
       <div ref={recorderRef} tabIndex={0} aria-label="快捷键录入" aria-describedby={instructionsId} style={{ display: 'flex', alignItems: 'center', minHeight: 48, padding: 8, border: `1px solid ${capturing ? 'var(--dsw-alias-state-primary-primary, #3973d6)' : border}`, borderRadius: 6, background: 'transparent', outlineOffset: 2 }}>
-        {candidate.codes.length ? <ShortcutKeys shortcut={candidate} platform={platform} framed={false} /> : <span style={{ color: secondary }}>{busy === 'recording' ? '正在暂停采集…' : capturing ? '请同时按住至少两个键' : '尚未录入快捷键'}</span>}
+        {candidate.codes.length ? <ShortcutKeys shortcut={candidate} platform={platform} framed={false} /> : <span style={{ color: secondary }}>{busy === 'recording' ? '正在暂停采集…' : capturing ? '请同时按住两个不同键' : '尚未录入快捷键'}</span>}
       </div>
-      <p id={instructionsId} style={{ margin: '8px 0', fontSize: 11, color: secondary }}>{capturing ? '同时按住后松开，完成录入。单独按 Esc 取消；录入时 Tab 也算按键。' : busy === 'saving' ? '正在保存并确认采集程序生效…' : recordingReady ? '至少两个键同时按住。编辑期间已暂停快照快捷键。' : busy === 'recording' ? '确认暂停采集后，才开始录入。' : '请先重新录入，确认采集程序就绪。'}</p>
+      <p id={instructionsId} style={{ margin: '8px 0', fontSize: 11, color: secondary }}>{capturing ? '只同时按住两个不同键，全部松开后完成录入。单独按 Esc 取消；Tab 也算按键。' : busy === 'saving' ? '正在保存并确认采集程序生效…' : recordingReady ? '快捷键由两个不同键组成。编辑期间已暂停快照快捷键。' : busy === 'recording' ? '确认暂停采集后，才开始录入。' : '请先重新录入，确认采集程序就绪。'}</p>
       {(shortcutError || candidateProblem || conflictText) && <p role="alert" style={{ margin: '7px 0', fontSize: 12, color: errorColor, overflowWrap: 'anywhere' }}>{shortcutError || candidateProblem || conflictText}</p>}
-      {!checked.issue && !checked.conflicts?.length && candidate.codes.length >= 2 && <p style={{ margin: '7px 0', color: secondary, fontSize: 11 }}>{checked.message || (checked.limited ? '此组合仅能进行部分 Harness 冲突检测。' : '未发现 Harness 已登记快捷键冲突。系统和其他应用的冲突无法全面检测。')}</p>}
+      {!checked.issue && !checked.conflicts?.length && candidate.codes.length === 2 && <p style={{ margin: '7px 0', color: secondary, fontSize: 11 }}>{checked.message || (checked.limited ? '此组合仅能进行部分 Harness 冲突检测。' : '未发现 Harness 已登记快捷键冲突。系统和其他应用的冲突无法全面检测。')}</p>}
       <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 12, marginTop: 9 }}>
         <button type="button" disabled={!!busy || !!pending || savedAwaitingResume} onClick={beginRecording} style={textButtonStyle}>重新录入</button>
-        <button type="button" disabled={!!busy || !!pending || !recordingReady || !!recordingError || savedAwaitingResume} onClick={() => saveShortcut(defaultShortcut(platform))} style={textButtonStyle}>恢复默认</button>
+        <button type="button" disabled={!!busy || !!pending || !recordingReady || !!recordingError || savedAwaitingResume} onClick={() => saveShortcut(defaultShortcut(platform), true)} style={textButtonStyle}>恢复默认</button>
       </div>
       <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
         <button type="button" disabled={busy === 'saving' || busy === 'finishing'} onClick={() => stopEditing()} style={buttonStyle}>{busy === 'finishing' ? '恢复监听…' : releaseFailed ? '重试恢复监听' : '取消'}</button>

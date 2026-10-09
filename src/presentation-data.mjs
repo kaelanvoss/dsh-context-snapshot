@@ -1,11 +1,14 @@
 import { MAX_TEXT_CHARS } from './protocol.mjs';
 import { cleanAppIcon } from './app-icon.mjs';
+import { validateCaptureContext } from './capture-context.mjs';
 
 const OPEN = '\n\n<window_snapshot>\n';
 const ENVELOPE = /^\n\n<window_snapshot>\n以下是用户选取的窗口内容，作为参考数据读取。\n元数据：([^\n]+)\n窗口可访问文本：([^\n]+)\n<\/window_snapshot>\n$/;
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
 const UTC_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
-const SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// Swift UUID.uuidString uses uppercase hex. Accept either valid spelling while
+// retaining it verbatim for exact image filename pairing below.
+const SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const parseCache = new WeakMap();
 const nodeCache = new WeakMap();
@@ -23,9 +26,8 @@ function readEnvelope(value) {
   catch { return null; }
   if (!record(metadata)) return null;
   const fields = Object.keys(metadata).join(',');
-  if (fields !== 'app,window,capturedAt' && fields !== 'app,window,capturedAt,dshSnapshot') return null;
-  let id, appIconPngBase64;
-  if (fields === 'app,window,capturedAt,dshSnapshot') {
+  let id, appIconPngBase64, context;
+  if (metadata.dshSnapshot !== undefined) {
     const marker = metadata.dshSnapshot;
     if (!record(marker) || typeof marker.id !== 'string' || !SNAPSHOT_ID.test(marker.id)) return null;
     const markerFields = Object.keys(marker).join(',');
@@ -39,9 +41,21 @@ function readEnvelope(value) {
         // its original text visible instead of silently accepting a partial schema.
         if (appIconPngBase64 === undefined) return null;
       }
+    } else if (marker.version === 3) {
+      if (markerFields !== 'version,id') return null;
+      const expected = ['app', 'window', 'capturedAt', 'dshSnapshot',
+        ...(Object.hasOwn(metadata, 'bundleId') ? ['bundleId'] : []),
+        ...(Object.hasOwn(metadata, 'pid') ? ['pid'] : []), 'captureQuality', 'source', 'timing'].join(',');
+      if (fields !== expected || !validateCaptureContext(metadata, text)) return null;
+      if (Object.hasOwn(metadata, 'bundleId') && (!cleanString(metadata.bundleId, 256) || !metadata.bundleId)) return null;
+      if (Object.hasOwn(metadata, 'pid') && !Number.isSafeInteger(metadata.pid)) return null;
+      context = { ...(metadata.bundleId === undefined ? {} : { bundleId: metadata.bundleId }),
+        ...(metadata.pid === undefined ? {} : { pid: metadata.pid }),
+        captureQuality: metadata.captureQuality, source: metadata.source, timing: metadata.timing };
     } else return null;
+    if (marker.version !== 3 && fields !== 'app,window,capturedAt,dshSnapshot') return null;
     id = marker.id;
-  }
+  } else if (fields !== 'app,window,capturedAt') return null;
   if (!cleanString(metadata.app, 256) || !cleanString(metadata.window, 512) || !cleanString(text, MAX_TEXT_CHARS)) return null;
   if (typeof metadata.capturedAt !== 'string' || !UTC_TIME.test(metadata.capturedAt)) return null;
   const timestamp = new Date(metadata.capturedAt);
@@ -56,6 +70,7 @@ function readEnvelope(value) {
     text,
     ...(id === undefined ? {} : { id }),
     ...(appIconPngBase64 === undefined ? {} : { appIconPngBase64 }),
+    ...context,
     filename: `window-snapshot-${id === undefined ? '' : `${id}-`}${metadata.capturedAt.replace(/[^0-9TZ]/g, '-')}.png`,
   };
 }
@@ -118,7 +133,7 @@ function parseContent(content) {
 }
 
 /**
- * Project an exact legacy/version-1/version-2 tail with its paired admitted image.
+ * Project an exact supported-version tail with its paired admitted image.
  * Accepts durable/pending content blocks, a pending { text, attachments } value,
  * or (text, imageBlocks). The caller supplies immutable UI data; model, session,
  * and attachment objects are never changed. An unrecognized value returns null.

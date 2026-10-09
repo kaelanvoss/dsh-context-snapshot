@@ -34,9 +34,9 @@ try
         gesture.Configure(document.RootElement);
     }
     var chord = new ShortcutGesture();
-    Configure(chord, "{\"version\":1,\"codes\":[\"ControlLeft\",\"ShiftRight\",\"KeyS\"]}");
-    Assert(!chord.Update("KeyS", true) && !chord.Update("ShiftRight", true), "Custom chords require every physical key.");
-    Assert(chord.Update("ControlLeft", true), "Custom three-key chords are order independent.");
+    Configure(chord, "{\"version\":1,\"codes\":[\"ControlLeft\",\"KeyS\"]}");
+    Assert(!chord.Update("KeyS", true), "Custom pairs require both physical keys.");
+    Assert(chord.Update("ControlLeft", true), "Custom two-key chords are order independent.");
     Assert(!chord.Update("KeyS", true), "Custom ordinary-key repeat cannot recapture.");
     chord.Update("ShiftLeft", true);
     chord.Update("ShiftLeft", false);
@@ -83,16 +83,15 @@ try
         Assert(transition.Configuration.Version == previous.Version && transition.Configuration.Codes.SequenceEqual(previous.Codes), "Rejected shortcut keeps the previous configuration.");
     }
     Reject("{\"version\":1,\"codes\":[\"F8\"]}");
+    Reject("{\"version\":1,\"codes\":[\"F8\",\"F9\",\"F10\"]}");
+    Reject("{\"version\":1,\"codes\":[\"F8\",\"F9\",\"F10\",\"F11\"]}");
     Reject("{\"version\":1,\"codes\":[\"F8\",\"F8\"]}");
     Reject("{\"version\":2,\"codes\":[\"F8\",\"F9\"]}");
     Reject("{\"version\":1,\"codes\":[\"F8\",\"CapsLock\"]}");
     Reject("{\"version\":1,\"codes\":[\"F8\",null]}");
     Reject("{\"version\":1,\"codes\":\"F8+F9\"}");
     Assert(!transition.Update("F9", true), "Rejected configuration also preserves the existing press latch.");
-    var many = new ShortcutGesture();
-    Configure(many, "{\"version\":1,\"codes\":[\"KeyA\",\"KeyB\",\"KeyC\",\"KeyD\",\"KeyE\",\"KeyF\",\"KeyG\",\"KeyH\",\"KeyI\"]}");
-    foreach (var code in many.Configuration.Codes[..^1]) Assert(!many.Update(code, true), "A long chord must not fire before its final key.");
-    Assert(many.Update("KeyI", true), "The gesture adds no arbitrary eight-key ceiling.");
+    Reject("{\"version\":1,\"codes\":[\"KeyA\",\"KeyB\",\"KeyC\",\"KeyD\",\"KeyE\",\"KeyF\",\"KeyG\",\"KeyH\",\"KeyI\"]}");
     Assert(ShortcutKeys.Resolve(0x11, 0x1D, 1) == "ControlRight" && ShortcutKeys.Resolve(0x11, 0x1D, 0) == "ControlLeft", "Generic Ctrl preserves physical sides.");
     Assert(ShortcutKeys.Resolve(0x10, 0x36, 0) == "ShiftRight" && ShortcutKeys.Resolve(0x10, 0x2A, 0) == "ShiftLeft", "Generic Shift preserves physical sides.");
     Assert(ShortcutKeys.Resolve(0x12, 0x38, 1) == "AltRight" && ShortcutKeys.Resolve(0x12, 0x38, 0) == "AltLeft", "Generic Alt preserves physical sides.");
@@ -155,6 +154,104 @@ try
     Assert(SnapshotPrivacy.CanRead(false, false), "Explicit or framework-defined FALSE privacy defaults permit visible non-password elements.");
     Assert(!SnapshotPrivacy.CanRead(true, false) && !SnapshotPrivacy.CanRead(false, true), "Password and hidden subtrees are excluded.");
     Assert(!SnapshotPrivacy.CanRead(null, false) && !SnapshotPrivacy.CanRead(false, null) && !SnapshotPrivacy.CanRead(null, null), "Cache read exceptions remain unknown/null and fail closed rather than being converted to FALSE defaults.");
+    Assert(SnapshotCaptureQuality.Create("Window", [], 1).Status == "available", "Successful text stays available without invented caveats.");
+    var partial = SnapshotCaptureQuality.Create("Window", ["text_budget_reached", "field_truncated", "text_budget_reached"], 3);
+    Assert(partial.Status == "partial" && partial.Reasons.SequenceEqual(new[] { "field_truncated", "text_budget_reached" }), "Partial reasons are unique and deterministic.");
+    Assert(SnapshotCaptureQuality.Create("", ["time_budget_reached"], 0).Status == "image_only", "A timed-out text provider produces image-only quality.");
+    Assert(limit.Reasons.Contains("text_budget_reached") && count.Reasons.Contains("depth_budget_reached") && count.Reasons.Contains("node_budget_reached"), "Output reports factual character, depth and node budget limits.");
+    var fieldLimited = new SnapshotTextTree(16_000, 300, 40);
+    fieldLimited.Append(new SnapshotNode { Role = "Edit", SelectedText = new string('s', 2000) }, 0);
+    Assert(fieldLimited.Reasons.Contains("field_truncated"), "Per-field truncation is reported even when the overall text budget is not exhausted.");
+    Assert(SnapshotPriority.Rank(true, false, "ToolBar") == 0 && SnapshotPriority.Rank(false, false, "ListItem", true) == 1 &&
+        SnapshotPriority.Rank(false, true, "Window") == 2 && SnapshotPriority.Rank(false, false, "Document") == 3 &&
+        SnapshotPriority.Rank(false, false, "ToolBar") == 4,
+        "Focus route, selected controls, modal dialog and document rank ahead of unrelated chrome without removing it.");
+    Assert(SnapshotSource.VerifiedUrl("https://example.com/path?selected=1") == "https://example.com/path?selected=1" &&
+        SnapshotSource.VerifiedUrl("example.com/from-title") == null && SnapshotSource.VerifiedUrl("javascript:alert(1)") == null,
+        "Document source URLs require an explicit absolute supported scheme.");
+    var recorder = new PhysicalShortcutRecorder();
+    var recordingWindow = new ShortcutRecordingWindow(20, 321);
+    Assert(recordingWindow.Matches(20, 321), "A recorder binds a specific foreground HWND and process.");
+    Assert(!recordingWindow.Matches(21, 321) && !recordingWindow.Matches(20, 322) && !new ShortcutRecordingWindow(0, 0).Matches(0, 0),
+        "Another Harness window, recycled HWND owner, and an unknown window must not match.");
+    var recordToken = "recording-test-token-1";
+    Assert(!recorder.Active, "Ordinary capture pause does not start a key recorder.");
+    Assert(recorder.Begin(recordToken, 1000, true, []).State == "waiting", "An explicit focused lease begins with no retained keys.");
+    var recordKeys = new[] { "ControlLeft", "ShiftRight" };
+    foreach (var key in recordKeys) recorder.Update(key, true, 1100, true);
+    Assert(recorder.Read(recordToken, 1200, true).Current.Length == 2 && recorder.Read(recordToken, 1200, true).Peak.Length == 2,
+        "The recorder observes two physical keys including exact modifier sides.");
+    recorder.Update("ShiftRight", true, 1200, true);
+    Assert(recorder.Read(recordToken, 1200, true).Peak.Length == 2, "Key repeat does not add a key or create history.");
+    recorder.Update("ControlLeft", false, 1300, true);
+    Assert(recorder.Read(recordToken, 1300, true).State == "holding", "The first release freezes the chord but does not complete it early.");
+    recorder.Update("KeyC", true, 1400, true);
+    Assert(!recorder.Read(recordToken, 1400, true).Current.Contains("KeyC") && !recorder.Read(recordToken, 1400, true).Peak.Contains("KeyC"),
+        "A post-release key cannot forge a never-simultaneous larger chord.");
+    foreach (var key in recordKeys) recorder.Update(key, false, 1500, true);
+    Assert(recorder.Read(recordToken, 1500, true).State == "complete" && recorder.Read(recordToken, 1500, true).Current.Length == 0,
+        "Only all releases complete the frozen candidate.");
+    Assert(recorder.Read(recordToken, 30_000, true).Peak.Length == 2 && recorder.Read(recordToken, 30_000, true).State == "complete",
+        "A completed candidate remains reviewable after the acquisition deadline.");
+    recorder.Check(31_000, false); recorder.Update("KeyC", true, 32_000, true);
+    Assert(!recorder.Active && recorder.Read(recordToken, 32_000, true).State == "complete" &&
+        recorder.Read(recordToken, 32_000, true).Peak.SequenceEqual(recordKeys.Order(StringComparer.Ordinal)),
+        "A completed candidate survives later focus changes and ignores new physical events.");
+    Assert(recorder.End(recordToken).Peak.Length == 0 && !recorder.Active, "Ending clears every key from memory.");
+    void RejectRecorder(Action action, string code)
+    {
+        try { action(); throw new Exception("Invalid recorder operation was accepted."); }
+        catch (ShortcutRecordingException exception) { Assert(exception.Code == code, "Recording errors retain their classified wire code."); }
+    }
+    RejectRecorder(() => recorder.Read("old-recording-token", 3000, true), "INVALID_RECORDING_TOKEN");
+    RejectRecorder(() => recorder.Begin("recording-test-token-2", 3000, true, ["KeyA"]), "KEYS_ALREADY_HELD");
+    RejectRecorder(() => recorder.Begin("recording-test-token-2", 3000, false, []), "RECORDING_NOT_FOCUSED");
+    recorder.Begin("recording-test-token-2", 4000, true, []);
+    RejectRecorder(() => recorder.Begin("recording-test-token-2", 4000, true, []), "INVALID_RECORDING_TOKEN");
+    recorder.Update("KeyA", true, 4100, true);
+    Assert(recorder.Read("recording-test-token-2", 19_000, true).State == "expired" &&
+        recorder.Read("recording-test-token-2", 19_000, true).Peak.Length == 0, "A fixed 15-second lease expires and clears unfinished keys.");
+    recorder.Begin("recording-test-token-3", 20_000, true, []);
+    recorder.Update("KeyA", true, 20_100, true);
+    Assert(recorder.Read("recording-test-token-3", 20_200, false).State == "interrupted" &&
+        recorder.Read("recording-test-token-3", 20_300, true).Peak.Length == 0, "Focus loss clears keys and cannot resume an interrupted lease.");
+    recorder.Begin("recording-test-token-4", 21_000, true, []);
+    recorder.Update("KeyA", true, 21_100, true); recorder.Update("KeyA", false, 21_200, true);
+    Assert(recorder.Read("recording-test-token-4", 21_300, true).State == "complete" &&
+        recorder.Read("recording-test-token-4", 21_300, true).Peak.Length == 1, "Single-key completion is explicit for the UI to reject.");
+    recorder.Update("KeyB", true, 21_350, true);
+    Assert(recorder.Read("recording-test-token-4", 21_350, true).Peak.SequenceEqual(["KeyA"]),
+        "Two non-overlapping single-key gestures must not become a pair.");
+    recorder.Stop(clearToken: true);
+    RejectRecorder(() => recorder.Read("recording-test-token-4", 21_400, true), "INVALID_RECORDING_TOKEN");
+    var manyKeys = new[] { "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI" };
+    recorder.Begin("recording-test-token-5", 22_000, true, []);
+    foreach (var key in manyKeys[..3]) recorder.Update(key, true, 22_100, true);
+    Assert(recorder.Read("recording-test-token-5", 22_100, true).State == "too_many" && !recorder.Active &&
+        recorder.Read("recording-test-token-5", 22_100, true).Current.Length == 0 &&
+        recorder.Read("recording-test-token-5", 22_100, true).Peak.Length == 0,
+        "The third simultaneous key terminates recording and cannot retain the first pair.");
+    foreach (var key in manyKeys[3..]) recorder.Update(key, true, 22_100, true);
+    foreach (var key in manyKeys) recorder.Update(key, false, 22_200, true);
+    Assert(recorder.Read("recording-test-token-5", 45_000, false).State == "too_many" &&
+        recorder.Read("recording-test-token-5", 45_000, false).Peak.Length == 0, "Further keys, releases, focus and time cannot recover a rejected larger chord.");
+    Assert(recorder.End("recording-test-token-5").State == "ended" && recorder.End("recording-test-token-5").Peak.Length == 0,
+        "Explicit cleanup of a rejected larger chord is idempotent.");
+    recorder.Begin("recording-test-token-6", 23_000, true, []);
+    recorder.Update("unmapped-255", true, 23_100, true);
+    Assert(recorder.Read("recording-test-token-6", 23_200, true).State == "interrupted" &&
+        recorder.Read("recording-test-token-6", 23_200, true).Peak.Length == 0, "Unsupported physical events cannot manufacture a chord.");
+    recorder.Begin("recording-test-token-7", 24_000, true, []);
+    recorder.Update("KeyA", true, 24_100, true);
+    recorder.Check(24_200, recordingWindow.Matches(21, 321));
+    Assert(recorder.Read("recording-test-token-7", 24_300, true).State == "interrupted" &&
+        recorder.Read("recording-test-token-7", 24_300, true).Peak.Length == 0, "Switching Harness windows terminates unfinished recording.");
+    recorder.Begin("recording-test-token-8", 25_000, true, []);
+    foreach (var key in new[] { "KeyA", "KeyB" }) recorder.Update(key, true, 25_100, true);
+    foreach (var key in new[] { "KeyA", "KeyB" }) recorder.Update(key, false, 25_200, true);
+    Assert(recorder.Read("recording-test-token-8", 25_300, true).State == "complete" &&
+        recorder.Read("recording-test-token-8", 25_300, true).Peak.SequenceEqual(["KeyA", "KeyB"]),
+        "A pair of different ordinary physical keys completes.");
     Console.WriteLine(JsonSerializer.Serialize(new { type = "self-test", ok = true, checks }));
     return 0;
 }

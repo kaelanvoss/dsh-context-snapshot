@@ -1,4 +1,5 @@
-import { attachSnapshot } from './draft.mjs';
+import { attachSnapshotDurably } from './draft.mjs';
+import { restoreSnapshotDrafts } from './draft-recovery.mjs';
 import { createSnapshotStore } from './snapshot-store.mjs';
 
 export async function request(body, signal) {
@@ -8,7 +9,7 @@ export async function request(body, signal) {
   return data;
 }
 
-export function createController(conversation, send = request, environment = {}, snapshots = createSnapshotStore()) {
+export function createController(conversation, send = request, environment = {}, snapshots = createSnapshotStore(), persistence) {
   const hasFocus = environment.hasFocus ?? (() => document.hasFocus() && document.visibilityState === 'visible');
   const schedule = environment.schedule ?? ((fn, ms) => setTimeout(fn, ms));
   const cancel = environment.cancel ?? (timer => clearTimeout(timer));
@@ -30,6 +31,23 @@ export function createController(conversation, send = request, environment = {},
       group.abort = new AbortController();
       const timeout = schedule(() => group.abort.abort(), 10_000);
       try {
+        let recoveryWarning;
+        const hasDrafts = snapshots.entries().some(([, entry]) => entry.sessionId === sessionId);
+        if (persistence && (hasFocus() || hasDrafts)) {
+          await snapshots.flushPersistence?.();
+          const recovered = await restoreSnapshotDrafts(conversation, target, snapshots, persistence);
+          if (recovered.retryAt != null) {
+            status({ error: '此会话的快照草稿正在另一窗口使用，请回到原窗口操作。' });
+            return;
+          }
+          if (recovered.unconfirmed) {
+            recoveryWarning = recovered.notice;
+            status({ error: recoveryWarning });
+          }
+          if (recovered.restored) status({ message: `已恢复 ${recovered.restored} 张未发送快照。`, error: undefined });
+          else if (recovered.pending) status({ message: '正在核对会话记录，确认发送状态后恢复快照。' });
+          if (stopped || group.disposed || !eligible(target) || group.active !== target) return;
+        }
         const data = await send({ op: 'poll', clientId: group.clientId, sessionId, viewId, generation: group.generation, claim: hasFocus() }, group.abort.signal);
         if (stopped || group.disposed || !eligible(target) || group.active !== target) return;
         status({ ...data.status, owner: data.owner });
@@ -37,22 +55,36 @@ export function createController(conversation, send = request, environment = {},
           if (item.sessionId !== sessionId || item.clientId !== group.clientId) continue;
           if (item.state === 'error') status({ ...data.status, error: item.error });
           else if (!applied.has(item.captureId)) {
-            if (!attachSnapshot(conversation, target, item.capture, snapshots)) continue;
+            const capture = persistence ? { ...item.capture, snapshotId: item.captureId } : item.capture;
+            if (!await attachSnapshotDurably(conversation, target, capture, snapshots, persistence)) continue;
             applied.add(item.captureId);
             if (applied.size > 128) applied.delete(applied.values().next().value);
             status({ ...data.status, message: '快照卡片已加入草稿；填写说明后发送。' });
           }
           await send({ op: 'ack', clientId: group.clientId, sessionId, captureId: item.captureId }, group.abort.signal);
         }
+        if (recoveryWarning) status({ error: recoveryWarning });
       } catch (e) { if (e.name !== 'AbortError') status({ error: `快照连接失败：${e.message}` }); }
       finally { cancel(timeout); if (!group.disposed && !stopped) group.timer = schedule(poll, 750); }
     }
-    group.dispose = () => { group.disposed = true; cancel(group.timer); group.abort?.abort(); void release(); groups.delete(sessionId); };
+    group.dispose = () => {
+      group.disposed = true; cancel(group.timer); group.abort?.abort(); void release();
+      groups.delete(sessionId);
+      if (!persistence) return;
+      if (!snapshots.hasInFlightSession?.(sessionId)) void persistence.release(sessionId).catch(() => {});
+      else void snapshots.waitForInFlight?.().then(() => {
+        // The user may return to this session before its detached send ends.
+        // Its new view retains the same ownership instead of receiving a
+        // late release from the retired composer.
+        if (!groups.has(sessionId) && !snapshots.hasInFlightSession?.(sessionId)) return persistence.release(sessionId);
+      }).catch(() => {});
+    };
     group.poll = poll;
     return group;
   }
   return {
     snapshots,
+    reportError(error) { for (const group of groups.values()) for (const target of group.members) target.onStatus?.({ error: error.message || String(error) }); },
     register(target) {
       if (stopped) return () => { target.alive = false; };
       let group = groups.get(target.sessionId);

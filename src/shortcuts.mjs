@@ -10,8 +10,8 @@ function modifierOf(code) { return modifierGroups[code.replace(/(Left|Right)$/, 
 function compare(a, b) { const left = modifiers.indexOf(a), right = modifiers.indexOf(b); return (left < 0 ? 100 : left) - (right < 0 ? 100 : right) || a.localeCompare(b); }
 export function validateShortcut(value, { platform = 'darwin', supportedCodes } = {}) {
   if (!value || value.version !== 1 || !Array.isArray(value.codes)) return '快捷键格式无效，请重新录入。';
-  if (value.codes.length < 2 || new Set(value.codes).size < 2) return '请同时按住至少两个不同的按键。';
-  if (new Set(value.codes).size !== value.codes.length) return '快捷键中不能重复同一个按键。';
+  if (value.codes.length !== 2) return '请同时按住两个不同的按键，快捷键只支持两个键。';
+  if (new Set(value.codes).size !== 2) return '请同时按住两个不同的按键，同一个按键不能重复。';
   const supported = new Set(supportedCodes ?? supportedShortcutCodes(platform));
   if (value.codes.some(code => typeof code !== 'string' || !supported.has(code))) return '这个组合包含当前系统不支持的按键，请重新录入。';
   return null;

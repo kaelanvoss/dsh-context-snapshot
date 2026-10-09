@@ -8,12 +8,64 @@ const control = { display: 'grid', placeItems: 'center', minWidth: 36, height: 3
 // and follow fullscreen changes; the browser-only layout keeps its usual inset.
 const toolbarPadding = 'max(14px, var(--dsh-frame-overlay-top, 14px)) 16px 14px';
 const EMPTY_TEXT = '此窗口未提供可访问文本；请查看图片。';
+const CAPTURE_SCOPES = {
+  provider_visible_window: '应用公开的当前窗口控件',
+  ax_visible_children_when_available: '辅助功能公开的窗口控件（优先使用可见控件列表）',
+  uia_control_view_visible: '当前窗口中未标记为屏幕外的控件',
+};
+const QUALITY_REASONS = {
+  accessibility_permission_denied: '未获得辅助功能权限',
+  accessibility_unavailable: '此窗口未提供可访问内容',
+  accessibility_timeout: '可访问内容采集超时',
+  ax_unavailable: '此窗口未提供可访问内容',
+  ax_timeout: '可访问内容采集超时',
+  ui_automation_timeout: '可访问内容采集超时',
+  ui_automation_unavailable: '此窗口未提供可访问内容',
+  text_limit: '文字达到采集长度上限',
+  text_truncated: '文字达到采集长度上限',
+  text_budget_reached: '文字达到采集长度上限',
+  node_limit: '控件数量达到采集上限',
+  node_budget_reached: '控件数量达到采集上限',
+  traversal_timeout: '控件遍历达到时间上限',
+  time_budget_reached: '控件遍历达到时间上限',
+  provider_read_failed: '部分控件未能读取',
+  field_truncated: '部分控件文字达到字段长度上限',
+  depth_budget_reached: '控件层级达到采集上限',
+  capture_quality_unreported: '采集程序未提供完整度信息',
+  window_unavailable: '未找到对应的可访问窗口',
+  no_accessible_text: '此窗口未提供可访问文字',
+  no_accessible_content: '未读取到可访问文字',
+};
+
+/** Do not claim legacy captures were complete: only explicit metadata can do so. */
+export function snapshotQualityLabel(capture) {
+  const status = capture.captureQuality?.status;
+  if (status === 'partial') return '文字部分获取';
+  if (status === 'image_only') return '仅图片';
+  if (status === 'available') return '';
+  return !capture.text?.trim() || capture.text.trim() === EMPTY_TEXT ? '仅图片' : '';
+}
 
 /** Saved accessibility data only: opening a preview never captures the window again. */
 export function snapshotPreviewText(capture) {
   const text = typeof capture.text === 'string' ? capture.text.trim() : '';
-  if (!text || text === EMPTY_TEXT) return '';
-  return `Window: ${JSON.stringify(capture.title || '窗口快照')}, App: ${capture.appName || '未知应用'}\nCaptured: ${capture.capturedAt || '未知时间'}\n\n${text}`;
+  const lines = [`Window: ${JSON.stringify(capture.title || '窗口快照')}, App: ${capture.appName || '未知应用'}`, `Captured: ${capture.capturedAt || '未知时间'}`];
+  const source = capture.source ?? {}, quality = capture.captureQuality, timing = capture.timing ?? {};
+  if (source.url) lines.push(`URL: ${source.url}`);
+  if (source.selectedText) lines.push(`选中文字：${source.selectedText}`);
+  if (source.focusedRole || source.focusedName) lines.push(`聚焦控件：${[source.focusedRole, source.focusedName].filter(Boolean).join(' · ')}`);
+  if (quality) {
+    const label = quality.status === 'available' ? '文字已获取' : snapshotQualityLabel(capture);
+    if (label) lines.push(`采集状态：${label}`);
+    if (quality.textSource) lines.push(`文字来源：${quality.textSource === 'ax' ? 'macOS 辅助功能（AX）' : quality.textSource === 'uia' ? 'Windows UI Automation' : quality.textSource}`);
+    if (Number.isSafeInteger(quality.nodeCount)) lines.push(`已采集控件：${quality.nodeCount}`);
+    if (quality.scope) lines.push(`采集范围：${CAPTURE_SCOPES[quality.scope] || quality.scope}`);
+    if (quality.reasons?.length) lines.push(`采集说明：${quality.reasons.map(reason => QUALITY_REASONS[reason] || reason).join('；')}`);
+  }
+  if (timing.imageCapturedAt) lines.push(`图片采集：${timing.imageCapturedAt}`);
+  if (timing.textStartedAt || timing.textFinishedAt) lines.push(`文字采集：${timing.textStartedAt || '未知'} → ${timing.textFinishedAt || '未知'}`);
+  lines.push('', text && text !== EMPTY_TEXT ? text : quality ? '本次快照未获取到可访问文字；请查看图片。' : EMPTY_TEXT);
+  return lines.join('\n');
 }
 
 function downloadName(capture, src, mediaType) {
@@ -109,21 +161,24 @@ export function SnapshotPreview({ items, initialIndex = 0, initialSrc, onClose }
   };
   const dialog = <div ref={root} role="dialog" tabIndex={-1} aria-modal="true" aria-label={`快照预览：${capture.title || '窗口快照'}`} data-snapshot-preview onKeyDown={onKeyDown} onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ position: 'fixed', inset: 0, zIndex: 2147483000, display: 'flex', flexDirection: 'column', background: 'rgb(0 0 0 / .86)', color: foreground, fontFamily: 'inherit', WebkitAppRegion: 'no-drag' }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: toolbarPadding, flexShrink: 0 }}>
-      <span style={{ color: '#fff', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13, opacity: .8 }}>{capture.title || '窗口快照'} · {capture.appName || '未知应用'}</span>
+      <div style={{ color: '#fff', minWidth: 0, fontSize: 13 }}>
+        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{capture.title || '窗口快照'} · {capture.appName || '未知应用'}</div>
+        <div style={{ marginTop: 3, fontSize: 12, opacity: .65 }}>{capture.capturedAt || '未知时间'}{snapshotQualityLabel(capture) ? ` · ${snapshotQualityLabel(capture)}` : ''}</div>
+      </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
-        {text && <button type="button" aria-pressed={textView} onClick={() => setTextView(current => !current)} style={{ ...control, ...(textView ? { background: 'var(--dsw-alias-brand-primary-new-colorprimary-new-color, #3977ee)', color: '#fff' } : {}) }}>查看文本</button>}
+        <button type="button" aria-pressed={textView} onClick={() => setTextView(current => !current)} style={{ ...control, ...(textView ? { background: 'var(--dsw-alias-brand-primary-new-colorprimary-new-color, #3977ee)', color: '#fff' } : {}) }}>查看文本</button>
         {src && !failed && <a aria-label="下载快照图片" title="下载快照图片" href={src} download={downloadName(capture, src, item.mediaType)} style={{ ...control, padding: 0, width: 36, textDecoration: 'none' }}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M12 3v12m-4-4 4 4 4-4M5 15v5h14v-5" /></svg></a>}
         <button ref={closeButton} type="button" aria-label="关闭快照预览" title="关闭快照预览" onClick={onClose} style={{ ...control, padding: 0, width: 36 }}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
       </div>
     </div>
     {textView ? <div onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ display: 'grid', placeItems: 'center', flex: 1, minHeight: 0, padding: '16px clamp(12px, 4vw, 56px) 64px' }}>
       <section aria-label="快照可访问性文本" style={{ display: 'flex', flexDirection: 'column', width: 'min(78vw, 896px)', maxWidth: '100%', height: 'min(72vh, 704px)', maxHeight: '100%', borderRadius: 16, overflow: 'hidden', background: surface, color: foreground, border: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, CanvasText 15%, transparent))' }}>
-        <div style={{ padding: '14px 20px', flexShrink: 0, color: 'var(--dsw-alias-label-secondary, CanvasText)', borderBottom: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, CanvasText 12%, transparent))', fontSize: 13 }}>纯文本</div>
+        <div style={{ padding: '14px 20px', flexShrink: 0, color: 'var(--dsw-alias-label-secondary, CanvasText)', borderBottom: '1px solid var(--dsw-alias-border-l1, color-mix(in srgb, CanvasText 12%, transparent))', fontSize: 13 }}>窗口状态</div>
         <pre tabIndex={0} style={{ margin: 0, padding: '18px 20px', overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', font: '13px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace' }}>{text}</pre>
       </section>
     </div> : <>
       <div ref={stage} onClick={event => { if (event.target === event.currentTarget) onClose(); }} onPointerDown={event => { if (!src || !stage.current || (event.pointerType === 'mouse' && event.button !== 0)) return; if (event.target.tagName !== 'IMG') return; drag.current = { x: event.clientX, y: event.clientY, left: stage.current.scrollLeft, top: stage.current.scrollTop }; root.current?.focus({ preventScroll: true }); event.target.setPointerCapture?.(event.pointerId); }} onPointerMove={event => { if (!drag.current) return; stage.current.scrollLeft = drag.current.left - (event.clientX - drag.current.x); stage.current.scrollTop = drag.current.top - (event.clientY - drag.current.y); }} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }} style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16, touchAction: 'pan-x pan-y' }}>
-        {src && !failed ? <div onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ display: 'flex', minWidth: '100%', minHeight: '100%', width: size ? Math.max(size.width * scale, viewport.width) : '100%', alignItems: 'center', justifyContent: 'center' }}><img src={src} alt={`${capture.appName || '未知应用'}：${capture.title || '窗口快照'}`} draggable={false} onLoad={event => { const image = event.currentTarget; if (image.naturalWidth && image.naturalHeight) setSize({ width: image.naturalWidth, height: image.naturalHeight }); }} onError={() => setFailed(true)} style={{ display: 'block', borderRadius: 8, width: size ? size.width * scale : 'auto', height: size ? size.height * scale : 'auto', maxWidth: size ? 'none' : '100%', maxHeight: size ? 'none' : '100%', flexShrink: 0, cursor: size && scale > fit ? 'grab' : 'default' }} /></div> : <p role="status" style={{ color: '#fff', textAlign: 'center', paddingTop: '25vh' }}>{failed || (!src && !item.loadSrc) ? '快照图片无法加载；已有文字仍可查看。' : '正在加载快照图片…'}</p>}
+        {src && !failed ? <div onClick={event => { if (event.target === event.currentTarget) onClose(); }} style={{ display: 'flex', minWidth: '100%', minHeight: '100%', width: size ? Math.max(size.width * scale, viewport.width) : '100%', alignItems: 'center', justifyContent: 'center' }}><img src={src} alt={`${capture.appName || '未知应用'}：${capture.title || '窗口快照'}`} draggable={false} onLoad={event => { const image = event.currentTarget; if (image.naturalWidth && image.naturalHeight) setSize({ width: image.naturalWidth, height: image.naturalHeight }); }} onError={() => setFailed(true)} style={{ display: 'block', borderRadius: 8, width: size ? size.width * scale : 'auto', height: size ? size.height * scale : 'auto', maxWidth: size ? 'none' : '100%', maxHeight: size ? 'none' : '100%', flexShrink: 0, cursor: size && scale > fit ? 'grab' : 'default' }} /></div> : <p role="status" style={{ color: '#fff', textAlign: 'center', paddingTop: '25vh' }}>{failed || (!src && !item.loadSrc) ? '快照图片无法加载；采集状态与来源仍可查看。' : '正在加载快照图片…'}</p>}
       </div>
       {src && !failed && <div role="group" aria-label="图片缩放" style={{ display: 'flex', justifyContent: 'center', gap: 4, padding: '12px 16px 18px', flexShrink: 0 }}><button type="button" aria-label="缩小图片" onClick={() => adjustZoom(1 / 1.2)} style={control}>−</button><button type="button" aria-label="适应窗口" title="适应窗口" onClick={() => setZoom(null)} style={control}>{Math.round(scale * 100)}%</button><button type="button" aria-label="放大图片" onClick={() => adjustZoom(1.2)} style={control}>＋</button></div>}
     </>}

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createShortcutRecording } from '../src/shortcut-recording.mjs';
+const token = number => `10000000-0000-4000-8000-${String(number).padStart(12, '0')}`;
 
 function fixture() {
   const harness = [], requests = [], faults = [], timers = new Map();
@@ -9,6 +10,72 @@ function fixture() {
   const recorder = createShortcutRecording(service, send, { id: 'window-one', schedule: fn => { const id = Symbol(); timers.set(id, fn); return id; }, cancel: id => timers.delete(id) });
   return { service, recorder, harness, requests, faults, timers };
 }
+function nativeFixture() {
+  const requests = [], harness = [], timers = new Map();
+  let state, count = 0, readFailure, endFailure;
+  const service = { async recording(active) { harness.push(active); } };
+  const send = async body => {
+    requests.push(body);
+    if (body.op === 'recording') { if (!body.active) state = null; return { status: { recording: body.active } }; }
+    if (body.op === 'beginShortcutRecording') state = { token: body.token, state: 'waiting', current: [], peak: [] };
+    if (body.op === 'shortcutRecordingState' && readFailure) throw readFailure;
+    if (body.op === 'endShortcutRecording') { if (endFailure) { const error = endFailure; endFailure = null; throw error; } state = { token: body.token, state: 'ended', current: [], peak: [] }; }
+    return { recordingState: state };
+  };
+  const recorder = createShortcutRecording(service, send, { id: 'window-one', randomUUID: () => token(++count), schedule: fn => { const id = Symbol(); timers.set(id, fn); return id; }, cancel: id => timers.delete(id) });
+  return { recorder, requests, harness, timers, setState(value) { state = value; }, failRead(error) { readFailure = error; }, failEnd(error) { endFailure = error; } };
+}
+
+test('native recorder begins only after pause acknowledgement and gives every attempt a fresh token', async () => {
+  const f = nativeFixture(), codes = ['ControlLeft', 'KeyK'];
+  const first = await f.recorder.begin('panel', codes);
+  assert.equal(first.token, token(1));
+  assert.deepEqual(f.requests.map(item => item.op), ['recording', 'beginShortcutRecording']);
+  const second = await f.recorder.begin('panel', codes);
+  assert.equal(second.token, token(2));
+  assert.deepEqual(f.requests.slice(-2).map(item => [item.op, item.token]), [['endShortcutRecording', token(1)], ['beginShortcutRecording', token(2)]]);
+  await assert.rejects(f.recorder.read('panel', token(1)), /已失效/);
+  f.setState({ token: token(2), state: 'complete', current: [], peak: codes });
+  assert.deepEqual((await f.recorder.read('panel', token(2))).peak, codes);
+  await f.recorder.update('panel', false);
+  assert.deepEqual(f.requests.slice(-2).map(item => item.op), ['endShortcutRecording', 'recording']);
+  assert.deepEqual(f.harness, [true, false]);
+  await f.recorder.dispose();
+});
+
+test('one physical recorder cannot be read or replaced by another panel in the same window', async () => {
+  const f = nativeFixture(), codes = ['KeyJ', 'KeyK'];
+  await f.recorder.begin('first', codes);
+  await assert.rejects(f.recorder.read('second', token(1)), /已失效/);
+  await assert.rejects(f.recorder.begin('second', codes), /另一面板/);
+  assert.equal(f.requests.filter(item => item.op === 'beginShortcutRecording').length, 1);
+  await f.recorder.update('second', false);
+  await f.recorder.dispose();
+  assert.deepEqual(f.requests.slice(-2).map(item => item.op), ['endShortcutRecording', 'recording']);
+  assert.equal(f.timers.size, 0);
+});
+
+test('malformed native peaks and read transport failures never turn into a DOM candidate', async () => {
+  const f = nativeFixture(), codes = ['KeyJ', 'KeyK'];
+  await f.recorder.begin('panel', codes);
+  f.setState({ token: token(1), state: 'complete', current: [], peak: ['KeyJ', 'KeyJ'] });
+  await assert.rejects(f.recorder.read('panel', token(1)), /按键无效/);
+  f.failRead(new Error('Helper restarted'));
+  await assert.rejects(f.recorder.read('panel', token(1)), /Helper restarted/);
+  await f.recorder.dispose();
+  await assert.rejects(f.recorder.begin('panel', codes), /已结束/);
+});
+
+test('a token retired by helper restart does not prevent a fresh owned recording', async () => {
+  const f = nativeFixture(), codes = ['KeyJ', 'KeyK'];
+  await f.recorder.begin('panel', codes);
+  f.failEnd(new Error('录入连接已失效，请重新录入。'));
+  const state = await f.recorder.begin('panel', codes);
+  assert.equal(state.token, token(2));
+  assert.equal(state.state, 'waiting');
+  assert.equal(f.requests.at(-1).op, 'beginShortcutRecording');
+  await f.recorder.dispose();
+});
 test('editing pauses Harness and native together, renews lease, and resumes on cancel', async () => {
   const f = fixture();
   await f.recorder.update('panel', true);

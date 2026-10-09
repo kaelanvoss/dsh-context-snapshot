@@ -64,7 +64,8 @@ export function installSnapshotPresentation(ctx) {
     for (const snapshot of presentation.snapshots) {
       const source = imageSource(snapshot.image);
       if (!source.preview?.url) continue;
-      previewMetadata.set(imageKey(sessionId, source), { appName: snapshot.appName, title: snapshot.title, capturedAt: snapshot.capturedAt, text: snapshot.text, filename: snapshot.filename, appIconPngBase64: snapshot.appIconPngBase64 });
+      const { image, imageIndex, ...capture } = snapshot;
+      previewMetadata.set(imageKey(sessionId, source), capture);
     }
   };
   const projectSession = (snapshot, sessionId) => {
@@ -96,7 +97,8 @@ export function installSnapshotPresentation(ctx) {
             // Only this view's cloned reference is tagged. An ordinary image
             // reusing the same durable bytes never inherits snapshot rendering.
             const attachment = { ...block.attachment };
-            attachmentMetadata.set(attachment, { appName: capture.appName, title: capture.title, capturedAt: capture.capturedAt, text: capture.text, filename: capture.filename, appIconPngBase64: capture.appIconPngBase64 });
+            const { image, imageIndex, ...metadata } = capture;
+            attachmentMetadata.set(attachment, metadata);
             return { ...block, attachment };
           });
           const projectedRow = { ...row, content };

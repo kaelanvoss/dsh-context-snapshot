@@ -29,6 +29,77 @@ test('strict legacy projection retains body, image identity and AX only in prese
   assert.equal(JSON.stringify(content), before);
 });
 
+test('version-3 source, quality and timing survive durable reload without decorating model context', () => {
+  const value = capture({ snapshotId: ID_ONE, appIconPngBase64: ICON_PNG, bundleId: 'com.example.browser', pid: 42,
+    captureQuality: { status: 'partial', reasons: ['node_budget_reached'], textSource: 'ax', nodeCount: 300, scope: 'provider_visible_window' },
+    source: { url: 'https://example.test/build', selectedText: 'Build failed', focusedRole: 'button', focusedName: 'Retry' },
+    timing: { imageCapturedAt: '2026-10-08T09:12:45Z', textStartedAt: '2026-10-08T09:12:45.010Z', textFinishedAt: '2026-10-08T09:12:46Z' },
+  });
+  const envelope = contextText(value);
+  assert.match(envelope, /"version":3/);
+  assert.doesNotMatch(envelope, /appIconPngBase64/);
+  const content = freeze([image(value), { type: 'text', text: '分析失败原因' + envelope }]);
+  const projected = parseSnapshotPresentation(JSON.parse(JSON.stringify(content)));
+  assert.equal(projected.text, '分析失败原因');
+  assert.equal(projected.snapshots[0].id, ID_ONE);
+  assert.deepEqual(projected.snapshots[0].captureQuality, value.captureQuality);
+  assert.deepEqual(projected.snapshots[0].source, value.source);
+  assert.deepEqual(projected.snapshots[0].timing, value.timing);
+  assert.equal(projected.snapshots[0].bundleId, value.bundleId);
+  assert.equal(projected.snapshots[0].pid, 42);
+  assert.equal(projected.snapshots[0].appIconPngBase64, undefined);
+  assert.equal(content.at(-1).text, '分析失败原因' + envelope);
+});
+
+test('version-3 image-only status pairs with the image and preserves permission reasons', () => {
+  const value = capture({ snapshotId: ID_TWO, text: '',
+    captureQuality: { status: 'image_only', reasons: ['accessibility_permission_denied'], textSource: 'ax', nodeCount: 0, scope: 'provider_visible_window' }, source: {}, timing: {} });
+  const projected = parseSnapshotPresentation(contentOf(value, ''));
+  assert.ok(projected);
+  assert.equal(projected.snapshots[0].text, '');
+  assert.deepEqual(projected.snapshots[0].captureQuality.reasons, ['accessibility_permission_denied']);
+  assert.deepEqual(projected.ordinaryContent, []);
+});
+
+test('Swift uppercase snapshot UUIDs retain exact identity and millisecond filename pairing', () => {
+  const value = capture({ snapshotId: 'BA57E563-9FFE-42F5-89D9-9C8F59AB48B5', capturedAt: '2026-10-09T11:02:19.777Z',
+    captureQuality: { status: 'partial', reasons: ['provider_read_failed'], textSource: 'ax', nodeCount: 7 }, source: {},
+    timing: { imageCapturedAt: '2026-10-09T11:02:19.777Z', textStartedAt: '2026-10-09T11:02:19.778Z', textFinishedAt: '2026-10-09T11:02:19.780Z' } });
+  const content = freeze(contentOf(value)), before = JSON.stringify(content);
+  const projected = parseSnapshotPresentation(JSON.parse(JSON.stringify(content)));
+  assert.ok(projected);
+  assert.equal(projected.snapshots[0].id, value.snapshotId);
+  assert.equal(projected.snapshots[0].filename, 'window-snapshot-BA57E563-9FFE-42F5-89D9-9C8F59AB48B5-2026-10-09T11-02-19-777Z.png');
+  assert.deepEqual(projected.snapshots[0].captureQuality, value.captureQuality);
+  assert.deepEqual(projected.snapshots[0].timing, value.timing);
+  assert.equal(projected.text, '请分析这个页面');
+  assert.equal(JSON.stringify(content), before);
+  const mismatched = { ...image(value), attachment: { ...image(value).attachment, name: filename({ ...value, snapshotId: value.snapshotId.toLowerCase() }) } };
+  assert.equal(parseSnapshotPresentation([mismatched, content.at(-1)]), null, 'identity spelling in the exact attachment filename must still match');
+  for (const id of [value.snapshotId.replace('BA57', 'GA57'), value.snapshotId.replace('42F5', '52F5')]) {
+    assert.equal(parseSnapshotPresentation(contentOf({ ...value, snapshotId: id })), null, 'non-UUID or wrong version cannot hide user text');
+  }
+});
+
+test('altered version-3 schemas and ambiguous image pairing cannot hide user content', () => {
+  const value = capture({ snapshotId: ID_ONE, captureQuality: { status: 'available', reasons: [], textSource: 'ax', nodeCount: 10 }, source: {}, timing: {} });
+  const envelope = contextText(value);
+  const invalid = [
+    envelope.replace('"version":3', '"version":4'),
+    envelope.replace('"version":3', '"version":3,"extra":true'),
+    envelope.replace('"version":3', `"version":3,"appIconPngBase64":"${ICON_PNG}"`),
+    envelope.replace('"status":"available"', '"status":"complete"'),
+    envelope.replace('"reasons":[]', '"reasons":["unrecognized_reason"]'),
+    envelope.replace('"source":{}', '"source":{"private":true}'),
+    envelope.replace('"timing":{}', '"timing":{"imageCapturedAt":"2026-02-30T00:00:00Z"}'),
+    envelope.replace('"captureQuality":', '"extra":true,"captureQuality":'),
+    envelope.replace('"nodeCount":10', '"nodeCount":301'),
+  ];
+  for (const text of invalid) assert.equal(parseSnapshotPresentation([image(value), { type: 'text', text }]), null);
+  assert.equal(parseSnapshotPresentation([image(value), image(value), { type: 'text', text: envelope }]), null);
+  assert.equal(parseSnapshotPresentation([image(value), { type: 'text', text: envelope + '后续正文' }]), null);
+});
+
 test('snapshot-only send has no visible text and keeps the image outside ordinary content', () => {
   const projected = parseSnapshotPresentation(contentOf(capture(), ''));
   assert.equal(projected.text, '');

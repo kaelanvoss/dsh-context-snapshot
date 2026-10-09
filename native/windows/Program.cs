@@ -27,8 +27,15 @@ internal static class Program
     private static readonly HashSet<Process> Workers = [];
     private static readonly SemaphoreSlim CaptureGate = new(1, 1);
     private static readonly ShortcutGesture Gesture = new();
+    private static readonly PhysicalShortcutRecorder Recorder = new();
+    private static readonly object RecordingWindowLock = new();
+    private static ShortcutRecordingWindow? recordingWindow;
+    private static System.Threading.Timer? recorderTimer;
     private static readonly Native.HookProc HookCallback = KeyboardHook;
+    private static readonly Native.WinEventProc FocusCallback = (_, _, _, _, _, _, _) =>
+    { CheckRecorder(); };
     private static nint hook;
+    private static nint focusHook;
     private static uint messageThread;
     private static int stopping;
 
@@ -90,12 +97,21 @@ internal static class Program
             return 1;
         }
         Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; Shutdown(); };
+        focusHook = Native.SetWinEventHook(3, 3, 0, FocusCallback, 0, 0, 0);
         _ = Task.Run(ReadCommands);
-        Write(new { type = "ready", protocol = 1, platform = "win32", shortcut = Gesture.Configuration, supportedCodes = ShortcutKeys.SupportedCodes, recording = true });
+        recorderTimer = new System.Threading.Timer(_ =>
+        {
+            CheckRecorder();
+        }, null, 100, 100);
+        Write(new { type = "ready", protocol = 1, platform = "win32", shortcut = Gesture.Configuration,
+            supportedCodes = ShortcutKeys.SupportedCodes, recording = true, supportsShortcutRecording = true });
         try { Application.Run(); }
         finally
         {
             Interlocked.Exchange(ref stopping, 1);
+            StopRecorder();
+            recorderTimer?.Dispose();
+            if (focusHook != 0) Native.UnhookWinEvent(focusHook);
             Native.UnhookWindowsHookEx(hook);
         }
         return 0;
@@ -114,6 +130,8 @@ internal static class Program
                 var key = ShortcutKeys.Resolve(input.vkCode, input.scanCode, input.flags)
                     ?? $"Unmapped:{input.vkCode}:{input.scanCode}:{input.flags & 1}";
                 var down = message == 0x100 || message == 0x104;
+                lock (RecordingWindowLock)
+                    if (Recorder.Active) Recorder.Update(key, down, Environment.TickCount64, RecordingWindowFocused());
                 if (Gesture.Update(key, down))
                 {
                     var target = Native.GetForegroundWindow();
@@ -158,7 +176,17 @@ internal static class Program
                         case "setRecording":
                             var active = request.GetProperty("active").GetBoolean();
                             Gesture.SetRecording(active);
+                            if (!active) StopRecorder();
                             Write(new { type = "result", id, ok = true, recording = active });
+                            break;
+                        case "beginShortcutRecording":
+                        case "shortcutRecordingState":
+                        case "endShortcutRecording":
+                            if (!Gesture.Recording || hook == 0 || focusHook == 0)
+                                throw new ShortcutRecordingException("RECORDING_NOT_READY", "Pause capture and confirm the listener before recording.");
+                            var token = request.TryGetProperty("token", out var tokenValue) && tokenValue.ValueKind == JsonValueKind.String ? tokenValue.GetString() : null;
+                            var recordingState = RecordCommand(method, token);
+                            Write(new { type = "result", id, ok = true, recordingState });
                             break;
                         case "shutdown":
                             Write(new { type = "result", id, ok = true });
@@ -171,12 +199,72 @@ internal static class Program
                 }
                 catch (Exception exception) when (exception is JsonException or InvalidOperationException or KeyNotFoundException)
                 {
-                    Write(new { type = "result", id, ok = false, error = new { code = "invalid_request", message = exception.Message } });
+                    Write(new { type = "result", id, ok = false, error = new { code = exception is ShortcutRecordingException recordingFailure ? recordingFailure.Code : "invalid_request", message = exception.Message } });
                 }
             }
         }
         catch (IOException exception) { Console.Error.WriteLine(exception.Message); }
         finally { Shutdown(); }
+    }
+
+    private static bool HarnessWindow(nint target)
+    {
+        if (target == 0) return false;
+        Native.GetWindowThreadProcessId(target, out var id);
+        try
+        {
+            using var process = Process.GetProcessById((int)id);
+            return new[] { "dsh", "deepseek", "deepseek-harness", "deepseek harness", "dsh desktop" }
+                .Contains(process.ProcessName, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        { return false; }
+    }
+    private static bool RecordingWindowFocused()
+    {
+        if (recordingWindow is not { } expected) return false;
+        var current = Native.GetForegroundWindow();
+        Native.GetWindowThreadProcessId(current, out var processId);
+        return expected.Matches(current, processId) && HarnessWindow(current);
+    }
+    private static void CheckRecorder()
+    {
+        lock (RecordingWindowLock)
+            if (Recorder.Active) Recorder.Check(Environment.TickCount64, RecordingWindowFocused());
+    }
+    private static ShortcutRecordingState RecordCommand(string method, string? token)
+    {
+        lock (RecordingWindowLock)
+        {
+            if (method == "beginShortcutRecording")
+            {
+                var target = Native.GetForegroundWindow();
+                Native.GetWindowThreadProcessId(target, out var processId);
+                if (target == 0 || processId == 0 || !HarnessWindow(target) || Native.GetForegroundWindow() != target)
+                    throw new ShortcutRecordingException("RECORDING_NOT_FOCUSED", "Keep the DeepSeek Harness recording window in the foreground.");
+                var state = Recorder.Begin(token, Environment.TickCount64, true, HeldCodes());
+                recordingWindow = new(target, processId);
+                return state;
+            }
+            if (method == "endShortcutRecording")
+            {
+                var state = Recorder.End(token);
+                recordingWindow = null;
+                return state;
+            }
+            return Recorder.Read(token, Environment.TickCount64, RecordingWindowFocused());
+        }
+    }
+    private static void StopRecorder()
+    {
+        lock (RecordingWindowLock) { Recorder.Stop(clearToken: true); recordingWindow = null; }
+    }
+    private static IEnumerable<string> HeldCodes()
+    {
+        // Used only before a fresh lease, not to reconstruct a candidate.
+        for (uint key = 1; key < 255; key++)
+            if ((Native.GetAsyncKeyState((int)key) & 0x8000) != 0 && key is not (1 or 2 or 4 or 5 or 6))
+                yield return "held";
     }
 
     private static async Task QueueCapture(nint target, string captureId)
@@ -220,6 +308,8 @@ internal static class Program
             throw new CaptureException("invalid_window", "The foreground window has no capture area.");
         if ((long)raw.Width * raw.Height > 32_000_000)
             throw new CaptureException("capture_too_large", "The foreground window exceeds the 32 megapixel capture limit.");
+        var title = new StringBuilder(4096);
+        Native.GetWindowText(target, title, title.Capacity);
 
         var frame = raw;
         if (Native.DwmGetWindowAttribute(target, 9, out Native.Rect visible, Marshal.SizeOf<Native.Rect>()) == 0 && visible.Width > 0 && visible.Height > 0)
@@ -241,6 +331,7 @@ internal static class Program
             }
             finally { graphics.ReleaseHdc(dc); }
         }
+        var imageCapturedAt = DateTime.UtcNow.ToString("O");
         using var image = full.Clone(new Rectangle(frame.Left - raw.Left, frame.Top - raw.Top, frame.Width, frame.Height), PixelFormat.Format32bppArgb);
         if (IsBlankBlack(image))
             throw new CaptureException("capture_unsupported", "The foreground application returned a blank window image.");
@@ -249,22 +340,30 @@ internal static class Program
         if (stream.Length > MaxPngBytes)
             throw new CaptureException("capture_too_large", "The PNG exceeds the 12 MiB attachment limit.");
 
-        var title = new StringBuilder(4096);
-        Native.GetWindowText(target, title, title.Capacity);
         using var process = Process.GetProcessById((int)processId);
         var iconWorker = ReadAppIconWorker(target, processId);
+        var textStartedAt = DateTime.UtcNow.ToString("O");
         var textWorker = RunWorker(1000, "--extract-text", HandleString(target)).GetAwaiter().GetResult();
-        var text = "";
-        string[] warnings = [];
-        if (textWorker.TimedOut) warnings = ["ui_automation_timeout"];
-        else if (textWorker.ExitCode != 0) warnings = ["ui_automation_unavailable"];
+        var textFinishedAt = DateTime.UtcNow.ToString("O");
+        var accessible = new TextResult("", SnapshotCaptureQuality.Create("", [], 0), new SnapshotSource(), textStartedAt, textFinishedAt);
+        if (textWorker.TimedOut || textWorker.ExitCode == 3) accessible = accessible with { CaptureQuality = SnapshotCaptureQuality.Create("", ["time_budget_reached"], 0) };
+        else if (textWorker.ExitCode != 0) accessible = accessible with { CaptureQuality = SnapshotCaptureQuality.Create("", ["accessibility_unavailable"], 0) };
         else
         {
-            try { text = JsonSerializer.Deserialize<TextResult>(textWorker.Output, JsonOptions)?.Text ?? ""; }
-            catch (JsonException) { warnings = ["ui_automation_unavailable"]; }
+            try { accessible = JsonSerializer.Deserialize<TextResult>(textWorker.Output, JsonOptions) ??
+                accessible with { CaptureQuality = SnapshotCaptureQuality.Create("", ["accessibility_unavailable"], 0) }; }
+            catch (JsonException) { accessible = accessible with { CaptureQuality = SnapshotCaptureQuality.Create("", ["accessibility_unavailable"], 0) }; }
         }
+        var finalProcessId = ValidateTarget(target);
+        var finalTitle = new StringBuilder(4096);
+        Native.GetWindowText(target, finalTitle, finalTitle.Capacity);
+        if (finalProcessId != processId || Native.GetForegroundWindow() != target || finalTitle.ToString() != title.ToString())
+            throw new CaptureException("window_context_changed", "The selected window changed during capture; capture it again.");
         return new CaptureData(Convert.ToBase64String(stream.ToArray()), title.ToString(), process.ProcessName,
-            (int)processId, image.Width, image.Height, text[..Math.Min(text.Length, MaxTextChars)], DateTime.UtcNow.ToString("O"), warnings,
+            (int)processId, image.Width, image.Height, accessible.Text, imageCapturedAt, accessible.CaptureQuality,
+            accessible.Source, new SnapshotTiming(imageCapturedAt, accessible.TextStartedAt, accessible.TextFinishedAt),
+            accessible.CaptureQuality.Reasons.Where(reason => reason is "time_budget_reached" or "accessibility_unavailable")
+                .Select(reason => reason == "time_budget_reached" ? "ui_automation_timeout" : "ui_automation_unavailable").ToArray(),
             iconWorker.GetAwaiter().GetResult());
     }
 
@@ -393,23 +492,24 @@ internal static class Program
 
     private static int ExtractTextWorker(nint target)
     {
-        var result = new TextResult("");
+        TextResult? result = null;
         Exception? failure = null;
         var worker = new Thread(() =>
         {
-            try { result = new TextResult(ReadWindowText(target)); }
+            try { result = ReadWindowText(target); }
             catch (Exception exception) { failure = exception; }
         }) { IsBackground = true };
         worker.SetApartmentState(ApartmentState.MTA);
         worker.Start();
         if (!worker.Join(900)) return 3;
-        if (failure != null) { Console.Error.WriteLine(failure.Message); return 1; }
+        if (failure != null || result == null) { Console.Error.WriteLine(failure?.Message ?? "The UI Automation worker did not return a result."); return 1; }
         Write(result);
         return 0;
     }
 
-    private static string ReadWindowText(nint target)
+    private static TextResult ReadWindowText(nint target)
     {
+        var startedAt = DateTime.UtcNow.ToString("O");
         var clock = Stopwatch.StartNew();
         var root = AutomationElement.FromHandle(target);
         var output = new SnapshotTextTree(MaxTextChars, MaxNodes, 40);
@@ -430,6 +530,8 @@ internal static class Program
             ExpandCollapsePattern.ExpandCollapseStateProperty, TogglePattern.ToggleStateProperty,
         }) details.Add(property);
         var nodes = 0;
+        var reasons = new HashSet<string>(StringComparer.Ordinal);
+        var source = new SnapshotSource();
         bool WithinBudget() => clock.ElapsedMilliseconds < 650 && nodes < MaxNodes && output.CanAppend;
         object? Cached(AutomationElement element, AutomationProperty property, bool ignoreDefaultValue = true)
         {
@@ -442,7 +544,7 @@ internal static class Program
                 return ReferenceEquals(value, AutomationElement.NotSupported) ? null : value;
             }
             catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
-            { return null; }
+            { reasons.Add("provider_read_failed"); return null; }
         }
         string? ReadRanges(TextPatternRange[] ranges)
         {
@@ -450,17 +552,40 @@ internal static class Program
             foreach (var range in ranges)
             {
                 if (!WithinBudget() || text.Length >= SnapshotTextTree.FieldChars) break;
-                var value = range.GetText(SnapshotTextTree.FieldChars - text.Length);
+                var value = range.GetText(SnapshotTextTree.FieldChars - text.Length + 1);
                 if (value.Length == 0) continue;
                 if (text.Length != 0 && text.Length < SnapshotTextTree.FieldChars) text.Append('\n');
                 var remaining = SnapshotTextTree.FieldChars - text.Length;
-                text.Append(value.AsSpan(0, Math.Min(value.Length, remaining)));
+                if (value.Length > remaining) reasons.Add("field_truncated");
+                text.Append(SnapshotTextTree.Bound(value, remaining));
             }
             return text.Length == 0 ? null : text.ToString();
         }
+        string Identity(AutomationElement element) => string.Join(",", element.GetRuntimeId());
+        var focusPath = new HashSet<string>(StringComparer.Ordinal);
+        var focusChildren = new Dictionary<string, AutomationElement>(StringComparer.Ordinal);
+        try
+        {
+            var focused = AutomationElement.FocusedElement;
+            var route = new HashSet<string>(StringComparer.Ordinal);
+            var routeChildren = new Dictionary<string, AutomationElement>(StringComparer.Ordinal);
+            var rootIdentity = Identity(root);
+            for (var depth = 0; focused != null && depth <= 40 && WithinBudget(); depth++)
+            {
+                var identity = Identity(focused);
+                if (!route.Add(identity)) break;
+                if (identity == rootIdentity) { focusPath = route; focusChildren = routeChildren; break; }
+                var parent = walker.GetParent(focused);
+                if (parent != null) routeChildren[Identity(parent)] = focused;
+                focused = parent;
+            }
+        }
+        catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
+        { reasons.Add("provider_read_failed"); }
         void Visit(AutomationElement element, int depth)
         {
-            if (!WithinBudget() || depth > 40) return;
+            if (!WithinBudget()) return;
+            if (depth > 40) { reasons.Add("depth_budget_reached"); return; }
             nodes++;
             try
             {
@@ -510,30 +635,69 @@ internal static class Program
                 {
                     if (WithinBudget() && element.TryGetCurrentPattern(TextPattern.Pattern, out var text) && text is TextPattern pattern)
                     {
-                        node = node with { Text = ReadRanges(pattern.GetVisibleRanges()) };
                         if (WithinBudget() && pattern.SupportedTextSelection != SupportedTextSelection.None)
                             node = node with { SelectedText = ReadRanges(pattern.GetSelection()) };
+                        if (WithinBudget()) node = node with { Text = ReadRanges(pattern.GetVisibleRanges()) };
                     }
                 }
-                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
+                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
+                { reasons.Add("provider_read_failed"); }
                 try
                 {
                     if (WithinBudget() && element.TryGetCurrentPattern(SelectionPattern.Pattern, out var selection) && selection is SelectionPattern pattern)
                         node = node with { SelectionCount = pattern.Current.GetSelection().Length };
                 }
-                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
+                catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
+                { reasons.Add("provider_read_failed"); }
+                if (node.Focused == true)
+                    source = source with { FocusedRole = node.Role,
+                        FocusedName = node.Name == null ? null : SnapshotTextTree.Bound(node.Name, 256) };
+                if (!string.IsNullOrEmpty(node.SelectedText) && (source.SelectedText == null || node.Focused == true))
+                    source = source with { SelectedText = node.SelectedText };
+                // UIA has no general page-URL property. Admit only a Document
+                // provider's explicit URL value, never guess from title or text.
+                if (node.Role == "Document" && source.Url == null && SnapshotSource.VerifiedUrl(node.Value) is { } url)
+                    source = source with { Url = url };
                 output.Append(node, depth);
+                // Read the already-rooted focus route before spending time
+                // enumerating a wide sibling list. The ordinary Visit privacy
+                // guard applies to each ancestor and the focused control.
+                if (WithinBudget() && focusChildren.TryGetValue(Identity(element), out var focusedChild))
+                    Visit(focusedChild, depth + 1);
                 var child = WithinBudget() ? walker.GetFirstChild(element) : null;
-                while (child != null && WithinBudget())
+                var children = new List<(AutomationElement Element, int Rank, int Index)>();
+                while (child != null && WithinBudget() && children.Count < MaxNodes - nodes)
                 {
-                    Visit(child, depth + 1);
-                    child = WithinBudget() ? walker.GetNextSibling(child) : null;
+                    var childIdentity = Identity(child);
+                    children.Add((child, focusPath.Contains(childIdentity) ? 0 : 4, children.Count));
+                    child = walker.GetNextSibling(child);
                 }
+                if (child != null && children.Count >= MaxNodes - nodes) reasons.Add("node_budget_reached");
+                var rankingDeadline = Math.Min(650, clock.ElapsedMilliseconds + 75);
+                for (var index = 0; index < Math.Min(children.Count, 24) && WithinBudget() && clock.ElapsedMilliseconds < rankingDeadline; index++)
+                {
+                    var item = children[index];
+                    if (item.Rank == 0) continue;
+                    var role = item.Element.GetCurrentPropertyValue(AutomationElement.ControlTypeProperty, true) as ControlType;
+                    var modal = item.Element.GetCurrentPropertyValue(WindowPattern.IsModalProperty, true) is true;
+                    var selected = item.Element.GetCurrentPropertyValue(SelectionItemPattern.IsSelectedProperty, true) is true;
+                    children[index] = (item.Element, SnapshotPriority.Rank(false, modal,
+                        role?.ProgrammaticName.Replace("ControlType.", "", StringComparison.Ordinal), selected), item.Index);
+                }
+                foreach (var item in children.OrderBy(item => item.Rank).ThenBy(item => item.Index))
+                    if (WithinBudget()) Visit(item.Element, depth + 1);
             }
-            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException) { }
+            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException or COMException)
+            { reasons.Add("provider_read_failed"); }
         }
         Visit(root, 0);
-        return output.ToString();
+        if (clock.ElapsedMilliseconds >= 650) reasons.Add("time_budget_reached");
+        if (nodes >= MaxNodes) reasons.Add("node_budget_reached");
+        reasons.UnionWith(output.Reasons);
+        var capturedText = output.ToString();
+        if (capturedText.Length == 0) reasons.Add("no_accessible_content");
+        return new TextResult(capturedText, SnapshotCaptureQuality.Create(capturedText, reasons, nodes), source,
+            startedAt, DateTime.UtcNow.ToString("O"));
     }
 
     private static async Task<WorkerResult> RunWorker(int timeoutMilliseconds, params string[] arguments)
@@ -584,6 +748,8 @@ internal static class Program
     private static void Shutdown()
     {
         if (Interlocked.Exchange(ref stopping, 1) != 0) return;
+        StopRecorder();
+        recorderTimer?.Dispose();
         lock (WorkerLock)
             foreach (var worker in Workers)
                 try { worker.Kill(entireProcessTree: true); }
@@ -612,9 +778,9 @@ internal static class Program
             Assert(!state.Update("ControlRight", false), "Both releases must not capture.");
             Assert(!state.Update("ControlRight", true), "Right Ctrl alone must not capture.");
             Assert(state.Update("ControlLeft", true), "Reverse press order must capture.");
-            using var custom = JsonDocument.Parse("{\"version\":1,\"codes\":[\"ControlLeft\",\"ShiftRight\",\"KeyS\"]}");
+            using var custom = JsonDocument.Parse("{\"version\":1,\"codes\":[\"ControlLeft\",\"KeyS\"]}");
             state.Configure(custom.RootElement);
-            Assert(!state.Update("KeyS", true) && !state.Update("ShiftRight", true), "A partial custom chord must not capture.");
+            Assert(!state.Update("KeyS", true), "A partial custom pair must not capture.");
             Assert(!state.Update("ControlLeft", true), "Keys held across reconfiguration must be released first.");
             state.Update("ControlLeft", false);
             state.Update("ControlRight", false);
@@ -624,7 +790,11 @@ internal static class Program
             state.SetRecording(false);
             Assert(!state.Update("ControlLeft", true), "Keys held through recording must not capture on repeat.");
             foreach (var key in custom.RootElement.GetProperty("codes").EnumerateArray()) state.Update(key.GetString(), false);
-            Assert(!state.Update("ControlLeft", true) && !state.Update("ShiftRight", true) && state.Update("KeyS", true), "Recording cleanup permits the next fresh chord.");
+            Assert(!state.Update("ControlLeft", true) && state.Update("KeyS", true), "Recording cleanup permits the next fresh pair.");
+            using var oversized = JsonDocument.Parse("{\"version\":1,\"codes\":[\"F8\",\"F9\",\"F10\"]}");
+            var oversizedRejected = false;
+            try { state.Configure(oversized.RootElement); } catch (InvalidOperationException) { oversizedRejected = true; }
+            Assert(oversizedRejected && state.Configuration.Codes.Length == 2, "Old three-key configurations must be rejected without replacing the pair.");
             Assert(TargetPolicy.IsExcluded("DeepSeek.exe"), "DSH must not capture itself.");
             Assert(TargetPolicy.IsExcluded("dsh-context-snapshot"), "Helper must not capture itself.");
             Assert(!TargetPolicy.IsExcluded("deepseek-notes"), "Do not exclude unrelated process names by substring.");
@@ -659,9 +829,11 @@ internal static class Program
         catch (Exception exception) { Write(new { type = "self-test", ok = false, checks, error = exception.Message }); return 1; }
     }
 
-    private sealed record CaptureData(string PngBase64, string Title, string AppName, int Pid, int Width, int Height, string Text, string CapturedAt, string[] Warnings,
+    private sealed record CaptureData(string PngBase64, string Title, string AppName, int Pid, int Width, int Height, string Text, string CapturedAt,
+        SnapshotCaptureQuality CaptureQuality, SnapshotSource Source, SnapshotTiming Timing,
+        string[] Warnings,
         [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AppIconPngBase64);
-    private sealed record TextResult(string Text);
+    private sealed record TextResult(string Text, SnapshotCaptureQuality CaptureQuality, SnapshotSource Source, string TextStartedAt, string TextFinishedAt);
     private sealed record IconResult(string? AppIconPngBase64);
     private sealed record WorkerError(string Code, string Message);
     private sealed record WorkerResult(string Output, int ExitCode, bool TimedOut);
@@ -671,6 +843,7 @@ internal static class Program
 internal static class Native
 {
     internal delegate nint HookProc(int code, nint message, nint data);
+    internal delegate void WinEventProc(nint hook, uint eventType, nint window, int objectId, int childId, uint thread, uint time);
     [StructLayout(LayoutKind.Sequential)] internal struct KeyboardInput { public uint vkCode, scanCode, flags, time; public nuint extraInfo; }
     [StructLayout(LayoutKind.Sequential)] internal readonly struct Rect(int left, int top, int right, int bottom)
     {
@@ -683,6 +856,9 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool UnhookWindowsHookEx(nint hook);
     [DllImport("user32.dll")] internal static extern nint CallNextHookEx(nint hook, int code, nint message, nint data);
     [DllImport("user32.dll")] internal static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] internal static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] internal static extern nint SetWinEventHook(uint minimum, uint maximum, nint module, WinEventProc callback, uint process, uint thread, uint flags);
+    [DllImport("user32.dll")] internal static extern bool UnhookWinEvent(nint hook);
     [DllImport("user32.dll")] internal static extern bool IsWindow(nint window);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(nint window);
     [DllImport("user32.dll")] internal static extern bool IsIconic(nint window);

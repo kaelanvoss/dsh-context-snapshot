@@ -50,15 +50,16 @@ function fixedCommand(id, ...bindings) { return { id, label: `固定 ${id}`, bin
 function ids(result) { return result.conflicts.map(row => row.id).sort(); }
 function officialIds(fixture, binding) { return Array.from(fixture.describeBinding(binding).conflicts).sort(); }
 
-test('shortcut configuration requires at least two distinct supported physical keys', () => {
-  for (const candidate of [null, {}, { version: 2, codes: ['F8', 'F9'] }, { version: 1, codes: 'F8+F9' }, snapshot(), snapshot('F8'), snapshot('F8', 'F8')]) {
+test('shortcut configuration requires exactly two distinct supported physical keys', () => {
+  for (const candidate of [null, {}, { version: 2, codes: ['F8', 'F9'] }, { version: 1, codes: 'F8+F9' }, snapshot(), snapshot('F8'), snapshot('F8', 'F8'), snapshot('KeyA', 'KeyB', 'KeyC'), snapshot('ControlLeft', 'ShiftLeft', 'KeyA', 'KeyB')]) {
     assert.equal(typeof validateShortcut(candidate), 'string');
     assert.throws(() => normalizeShortcut(candidate));
   }
-  for (const candidate of [snapshot('MetaLeft', 'KeyS'), snapshot('F8', 'F9'), snapshot('ControlLeft', 'ControlRight'), snapshot('KeyA', 'KeyB', 'KeyC')]) {
+  for (const candidate of [snapshot('MetaLeft', 'KeyS'), snapshot('F8', 'F9'), snapshot('ControlLeft', 'ControlRight')]) {
     assert.equal(validateShortcut(candidate), null);
   }
-  assert.match(validateShortcut(snapshot('F8', 'F9', 'F9')), /重复/);
+  assert.match(validateShortcut(snapshot('F8', 'F8')), /重复/);
+  assert.match(validateShortcut(snapshot('F8', 'F9', 'F10')), /只支持两个键/);
   assert.match(validateShortcut(snapshot('F8', null)), /不支持/);
   assert.match(validateShortcut(snapshot('F8', 'Unknown')), /不支持/);
   assert.match(validateShortcut(snapshot('F8', 'CapsLock')), /不支持/);
@@ -66,14 +67,14 @@ test('shortcut configuration requires at least two distinct supported physical k
   assert.match(validateShortcut(snapshot('F8', 'F9'), { supportedCodes: ['F8'] }), /不支持/);
 });
 
-test('normalization retains physical sides and imposes no arbitrary eight-key ceiling', () => {
-  const original = snapshot('KeyS', 'MetaRight', 'ControlLeft', 'MetaLeft');
+test('normalization retains physical sides and never truncates an oversized combination', () => {
+  const original = snapshot('MetaRight', 'ControlLeft');
   const normalized = normalizeShortcut(original);
-  assert.deepEqual(normalized, snapshot('ControlLeft', 'MetaLeft', 'MetaRight', 'KeyS'));
-  assert.deepEqual(original.codes, ['KeyS', 'MetaRight', 'ControlLeft', 'MetaLeft']);
+  assert.deepEqual(normalized, snapshot('ControlLeft', 'MetaRight'));
+  assert.deepEqual(original.codes, ['MetaRight', 'ControlLeft']);
   const many = snapshot(...'ABCDEFGHI'.split('').map(letter => `Key${letter}`));
-  assert.equal(validateShortcut(many), null);
-  assert.equal(normalizeShortcut(many).codes.length, 9);
+  assert.match(validateShortcut(many), /只支持两个键/);
+  assert.throws(() => normalizeShortcut(many), /只支持两个键/);
 });
 
 test('platform defaults and labels preserve left/right Command, Ctrl, Option, and Win', () => {
@@ -105,7 +106,7 @@ test('official editable conflicts honor effective user overrides, unbound comman
   assert.equal(result.issue, null);
   assert.deepEqual(ids(result), officialIds(fixture, { code: 'KeyS', modifiers: ['meta'] }));
   assert.deepEqual(result.conflicts, [{ id: 'save', label: '命令 save' }]);
-  assert.deepEqual(ids(inspectHarnessConflicts(snapshot('MetaLeft', 'ShiftLeft', 'KeyS'), fixture)), ['shift-save']);
+  assert.deepEqual(ids(inspectHarnessConflicts(snapshot('ShiftLeft', 'KeyS'), fixture)), [], 'Shift alone does not match a Meta+Shift binding');
   assert.deepEqual(ids(inspectHarnessConflicts(snapshot('ControlLeft', 'KeyS'), fixture)), []);
   fixture.catalog.set([command('save', { code: 'KeyP', modifiers: ['meta'] }, { modified: true }), command('unbound', null)]);
   assert.deepEqual(ids(inspectHarnessConflicts(snapshot('MetaRight', 'KeyS'), fixture)), []);
@@ -153,21 +154,14 @@ test('logical primary bindings use the actual receiving service platform', () =>
   assert.deepEqual(ids(inspectHarnessConflicts(snapshot('MetaLeft', 'KeyS'), windows, 'win32')), []);
 });
 
-test('pure modifiers, both physical modifier sides, and three ordinary keys report partial detection', () => {
+test('both physical modifier sides retain partial conflict detection', () => {
   const fixture = service({ editable: [command('save', { code: 'KeyS', modifiers: ['meta'] })] });
   const pure = inspectHarnessConflicts(snapshot('MetaLeft', 'MetaRight'), fixture);
   assert.equal(pure.issue, null);
   assert.equal(pure.limited, true);
   assert.deepEqual(pure.conflicts, []);
   assert.match(pure.message, /部分检测/);
-  const bothSides = inspectHarnessConflicts(snapshot('MetaLeft', 'MetaRight', 'KeyS'), fixture);
-  assert.equal(bothSides.limited, true);
-  assert.deepEqual(ids(bothSides), ['save']);
-  const many = inspectHarnessConflicts(snapshot('MetaRight', 'KeyA', 'KeyS', 'KeyZ'), fixture);
-  assert.equal(many.issue, null);
-  assert.equal(many.limited, true);
-  assert.deepEqual(ids(many), ['save']);
-  assert.match(many.message, /系统及其他应用/);
+  assert.match(pure.message, /系统及其他应用/);
 });
 
 test('native-supported keys beyond the official binding alphabet retain partial detection', () => {
@@ -207,11 +201,13 @@ test('missing, loading, unreadable, or throwing directories fail closed with an 
   assert.equal(result.limited, true);
 });
 
-test('invalid one-key input is rejected before inspecting the Harness directory', () => {
+test('invalid one-key and oversized input are rejected before inspecting the Harness directory', () => {
   const fixture = service();
   fixture.catalog.getSnapshot = () => { throw new Error('should not inspect'); };
-  const result = inspectHarnessConflicts(snapshot('F8'), fixture);
-  assert.match(result.issue, /至少两个/);
-  assert.equal(result.limited, false);
-  assert.deepEqual(result.conflicts, []);
+  for (const candidate of [snapshot('F8'), snapshot('F8', 'F9', 'F10')]) {
+    const result = inspectHarnessConflicts(candidate, fixture);
+    assert.match(result.issue, /只支持两个键/);
+    assert.equal(result.limited, false);
+    assert.deepEqual(result.conflicts, []);
+  }
 });

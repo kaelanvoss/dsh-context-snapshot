@@ -96,7 +96,15 @@ export class NativeBridge {
     if (frame.type === 'result') {
       if (frame.ok && frame.permissions) this.broker.status.permissions = frame.permissions;
       const task = this.pending.get(frame.id);
-      if (task) { this.pending.delete(frame.id); frame.ok ? task.resolve(task.method === 'permissions' || task.method === 'requestPermissions' ? frame.permissions ?? {} : frame) : task.reject(new Error(frame.error?.message ?? '原生请求失败')); }
+      if (task) {
+        this.pending.delete(frame.id);
+        if (frame.ok) task.resolve(task.method === 'permissions' || task.method === 'requestPermissions' ? frame.permissions ?? {} : frame);
+        else {
+          const error = new Error(frame.error?.message ?? '原生请求失败');
+          if (typeof frame.error?.code === 'string' && /^[A-Z_]{1,64}$/.test(frame.error.code)) error.code = frame.error.code;
+          task.reject(error);
+        }
+      }
     }
   }
   async waitReady() {
