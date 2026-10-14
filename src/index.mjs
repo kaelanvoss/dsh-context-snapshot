@@ -5,8 +5,9 @@ import { MAX_LINE_BYTES } from './protocol.mjs';
 import { SnapshotDraftArchive } from './draft-persistence.mjs';
 import { createDraftSessionEnsurer } from './draft-session.mjs';
 import { validRecordingToken } from './shortcut-native-state.mjs';
+import { installSnapshotTitles } from './snapshot-titles.mjs';
 export const name = 'dsh-context-snapshot';
-export const inject = ['connection', 'sessions', 'sessionPersistence', 'workspaceRegistry'];
+export const inject = ['connection', 'sessions', 'sessionPersistence', 'workspaceRegistry', 'sessionTitle'];
 
 const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f]/.test(value);
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
@@ -79,6 +80,7 @@ export function apply(ctx, config = {}) {
   const native = new NativeBridge(broker, { helperPath: config.helperPath });
   const shortcuts = new ShortcutSettings(native, broker);
   const drafts = new SnapshotDraftArchive({ ensureSession: createDraftSessionEnsurer(ctx) });
+  installSnapshotTitles(ctx);
   broker.status.draftApiVersion = 1;
   ctx.connection.fetch.register({ path: '/api/context-snapshot', methods: ['POST'], requestBody: 'buffered', fetch: createHandler(broker, native, shortcuts, drafts) });
   ctx.effect(() => async () => { shortcuts.dispose(); native.dispose(); broker.dispose(); await drafts.dispose(); });

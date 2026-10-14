@@ -10,16 +10,16 @@
 
 ## 安装
 
-当前版本：`0.6.1`。支持采集质量与来源预览、未发送快照恢复，以及弹窗内自定义双键快捷键；修复 macOS 大写快照 ID 在发送后未识别为卡片的问题。支持 Harness `0.2.0-rc.2` 和 `0.2.1-alpha.1`；其它版本尚未核验。
+当前版本：`0.7.0`，新增快照会话自动标题，保留采集质量与来源预览、未发送快照恢复，以及弹窗内自定义双键快捷键。支持 Harness `0.2.0-rc.2` 和 `0.2.1-alpha.1`；其它版本尚未核验。
 
 | 系统 | 默认捕获快捷键 | 安装包 |
 | --- | --- | --- |
-| macOS 13+，Apple Silicon / Intel | 左 Command + 右 Command | [macOS](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.6.1/dsh-context-snapshot-0.6.1-macos.tgz) |
-| Windows 10/11 x64 | 左 Ctrl + 右 Ctrl | [Windows x64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.6.1/dsh-context-snapshot-0.6.1-windows-x64.tgz) |
-| Windows 10/11 ARM64 | 左 Ctrl + 右 Ctrl | [Windows ARM64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.6.1/dsh-context-snapshot-0.6.1-windows-arm64.tgz) |
+| macOS 13+，Apple Silicon / Intel | 左 Command + 右 Command | [macOS](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.7.0/dsh-context-snapshot-0.7.0-macos.tgz) |
+| Windows 10/11 x64 | 左 Ctrl + 右 Ctrl | [Windows x64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.7.0/dsh-context-snapshot-0.7.0-windows-x64.tgz) |
+| Windows 10/11 ARM64 | 左 Ctrl + 右 Ctrl | [Windows ARM64](https://github.com/kaelanvoss/dsh-context-snapshot/releases/download/v0.7.0/dsh-context-snapshot-0.7.0-windows-arm64.tgz) |
 
 1. 下载对应系统的 **`.tgz` 安装包**，解压后找到其中的 `package` 目录。
-2. 打开 Harness Desktop 的「插件 → 添加插件」，填写这个目录的绝对路径，例如 `C:\Downloads\dsh-context-snapshot-0.6.1-windows-x64\package`。
+2. 打开 Harness Desktop 的「插件 → 添加插件」，填写这个目录的绝对路径，例如 `C:\Downloads\dsh-context-snapshot-0.7.0-windows-x64\package`。
 3. 安装并启用插件，打开会话，点击「快照」确认已就绪。若按钮未出现，完全退出再打开 Harness。
 
 **升级已有版本**：先禁用插件，等待采集程序退出，卸载旧版，再通过「添加插件」安装新版。这与 Harness 当前的升级提示一致。Windows 从 `0.4.2` 或更早版本首次升级时，旧采集程序仍可能锁住安装目录；禁用后若无法卸载或仍报 `EPERM`，完全退出 Harness（包括托盘），按下方恢复步骤处理。
@@ -42,13 +42,13 @@
 macOS：
 
 ```sh
-dsh plugin --profile desktop add "/absolute/path/dsh-context-snapshot-0.6.1-macos.tgz"
+dsh plugin --profile desktop add "/absolute/path/dsh-context-snapshot-0.7.0-macos.tgz"
 ```
 
 Windows PowerShell：
 
 ```powershell
-dsh plugin --profile desktop add "C:\Downloads\dsh-context-snapshot-0.6.1-windows-x64.tgz"
+dsh plugin --profile desktop add "C:\Downloads\dsh-context-snapshot-0.7.0-windows-x64.tgz"
 ```
 
 macOS 若找不到 `dsh`，可使用 Desktop 自带的 CLI：`/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`。
@@ -95,6 +95,16 @@ dsh plugin --profile desktop remove dsh-context-snapshot
 - 旧配置若包含三个或更多键，将明确提示并使用默认双键组合；保存新的双键组合后才覆盖旧文件。
 
 配置文件为 macOS 的 `~/Library/Application Support/dsh-context-snapshot/shortcut.json`，或 Windows 的 `%LOCALAPPDATA%\dsh-context-snapshot\shortcut.json`，与插件安装目录分离。它只保存按键代码，不保存用户输入内容。
+
+### 会话标题
+
+新会话首次只发送快照时，先显示捕获时保存的窗口标题；没有窗口标题则显示应用窗口快照。有正文时优先使用正文意图。随后由 Harness 已登记的官方标题模型生成简短摘要，失败时保留来源标题，正常回复不等待摘要。
+
+标题生成只收到精简后的正文、窗口来源、选区与少量可访问文字，完整 JSON 标题请求不超过 3072 UTF-8 字节；图标、图片编码、时间戳和内部 `window_snapshot` 格式不进入这个辅助请求。Agent 收到的完整截图与可访问文本保持原样。模型输出由官方标题服务规范成单行并限制长度，序列化 XML／JSON 等不合格摘要不会替换来源标题。
+
+用户手动命名后，尚未完成的自动摘要及后续消息均不覆盖它。标题写入官方会话记录，侧边栏、顶部和重启恢复使用同一结果。已经存在的自动 XML 兜底标题，在会话重新加载时会改为来源标题；这个修复不重新请求模型，也不覆盖手动标题或已生成的摘要。
+
+接入沿用已有的 `session-title-first-prompt-llm` 提供方及其模型、超时和输出预算，不额外注册第二个标题提供方。未知自定义标题提供方保持原行为。读取其已登记实例属于两个已核验 Harness 版本的实现适配；升级 Harness 时需要重新核验，接口不匹配会提示日志并保留来源标题能力。
 
 ## 注意事项
 
@@ -153,7 +163,7 @@ npm run pack:windows-arm64
 
 构建脚本会运行原生自测，可安装的 `.tgz` 输出到 `artifacts/`。打包命令可指定输出目录，例如 `npm run pack:windows-x64 -- C:\Downloads`。
 
-本地 Host / Client 构建及 305 项 JavaScript / 官方接口回归通过，macOS universal 构建与 30 个原生自测组通过。macOS 真实 Harness 已验证双键录入保存、A+D 完整重启后触发、未发送草稿重启恢复、移除与成功发送清理、图片／文本预览及下载，以及已知 Host 拒绝后的无重复重试；独立新会话的模型图文读取也已验证。Windows x64 / ARM64 已有零错误交叉构建及 116 项可移植策略检查，本轮按用户要求跳过 Windows 真机捕获、UIA 与全局快捷键验收。
+本地 0.7.0 Host / Client 构建及 351 项 JavaScript / 官方接口回归通过。真实 macOS Harness 已验证快照新会话的来源兜底、后台模型摘要、侧栏与顶部标题一致、手动命名在后续消息及完整重启后保留，以及旧 XML 自动兜底补正；标题辅助请求不改写 Agent 的快照上下文。0.6.1 的既有证据包括 macOS universal 构建与 30 个原生自测组、双键录入保存、A+D 完整重启后触发、未发送草稿重启恢复、移除与成功发送清理、图片／文本预览及下载、已知 Host 拒绝后的无重复重试，以及独立新会话的模型图文读取。本轮未修改原生程序，沿用已核验的 helper。Windows x64 / ARM64 已有零错误交叉构建及 116 项可移植策略检查，本轮按用户要求跳过 Windows 真机捕获、UIA 与全局快捷键验收。
 
 Release 工作流从发布 tag 重建三个平台安装包，核验附件并备份旧 Release 元数据后，只保留最新版稳定 Release 的下载，历史源码 tag 保留。远端构建与发布结果以对应 GitHub Actions / Release 为准；构建和自动检查不替代未覆盖的系统权限、硬件及故障场景实测。完整记录见 [VALIDATION.md](VALIDATION.md)。
 

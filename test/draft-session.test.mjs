@@ -28,7 +28,7 @@ async function directory(t) {
 }
 
 test('default Host registration waits for every service needed to preserve exact Session identity', () => {
-  assert.deepEqual(inject, ['connection', 'sessions', 'sessionPersistence', 'workspaceRegistry']);
+  assert.deepEqual(inject, ['connection', 'sessions', 'sessionPersistence', 'workspaceRegistry', 'sessionTitle']);
 });
 
 test('a blank Session is durably materialized and registered before its exact workspace is acknowledged', async t => {
